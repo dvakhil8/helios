@@ -1,0 +1,37 @@
+{
+  "name": "helios_eval__skew_join_orders__{{run_id}}",
+  "tags": {
+    "helios_eval": "true",
+    "helios_eval_run_id": "{{run_id}}",
+    "helios_eval_fixture": "skew_join_orders",
+    "helios_eval_role": "{{role}}"
+  },
+  "tasks": [
+    {
+      "task_key": "daily_revenue",
+      "notebook_task": {
+        "notebook_path": "{{notebook_path}}",
+        "source": "WORKSPACE"
+      },
+      "job_cluster_key": "main",
+      "timeout_seconds": 3600
+    }
+  ],
+  "job_clusters": [
+    {
+      "job_cluster_key": "main",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 1,
+        "spark_conf": {
+          "spark.databricks.delta.preview.enabled": "true",
+          "spark.sql.adaptive.enabled": "false",
+          "spark.sql.adaptive.skewJoin.enabled": "false",
+          "spark.sql.shuffle.partitions": "200"
+        }
+      }
+    }
+  ],
+  "max_concurrent_runs": 1
+}

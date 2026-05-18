@@ -1,0 +1,32 @@
+[project]
+name = "helios"
+version = "0.1.0"
+description = "Helios — LLM-driven CLI agent for Databricks, GitHub, and your terminal"
+requires-python = ">=3.10"
+dependencies = [
+    "databricks-sdk>=0.30.0",
+    "openai>=1.40.0",
+    "typer>=0.12.0",
+    "rich>=13.0",
+    "PyGithub>=2.1.0",
+    "requests>=2.31.0",
+    "prompt_toolkit>=3.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[project.scripts]
+helios = "helios.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/helios"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"

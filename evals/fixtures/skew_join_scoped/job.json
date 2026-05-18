@@ -1,0 +1,78 @@
+{
+  "name": "helios_eval__skew_join_scoped__{{run_id}}",
+  "tags": {
+    "helios_eval": "true",
+    "helios_eval_run_id": "{{run_id}}",
+    "helios_eval_fixture": "skew_join_scoped",
+    "helios_eval_role": "{{role}}"
+  },
+  "tasks": [
+    {
+      "task_key": "ingest_orders",
+      "notebook_task": {
+        "notebook_path": "{{notebook_ingest_orders}}",
+        "source": "WORKSPACE"
+      },
+      "job_cluster_key": "main",
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "ingest_users",
+      "notebook_task": {
+        "notebook_path": "{{notebook_ingest_users}}",
+        "source": "WORKSPACE"
+      },
+      "job_cluster_key": "main",
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "daily_revenue",
+      "depends_on": [
+        {"task_key": "ingest_orders"},
+        {"task_key": "ingest_users"}
+      ],
+      "notebook_task": {
+        "notebook_path": "{{notebook_daily_revenue}}",
+        "source": "WORKSPACE"
+      },
+      "job_cluster_key": "main",
+      "timeout_seconds": 3600
+    },
+    {
+      "task_key": "enrich_with_targets",
+      "depends_on": [{"task_key": "daily_revenue"}],
+      "notebook_task": {
+        "notebook_path": "{{notebook_enrich_with_targets}}",
+        "source": "WORKSPACE"
+      },
+      "job_cluster_key": "main",
+      "timeout_seconds": 1800
+    },
+    {
+      "task_key": "publish_dashboard",
+      "depends_on": [{"task_key": "enrich_with_targets"}],
+      "notebook_task": {
+        "notebook_path": "{{notebook_publish_dashboard}}",
+        "source": "WORKSPACE"
+      },
+      "job_cluster_key": "main",
+      "timeout_seconds": 1800
+    }
+  ],
+  "job_clusters": [
+    {
+      "job_cluster_key": "main",
+      "new_cluster": {
+        "spark_version": "14.3.x-scala2.12",
+        "node_type_id": "i3.xlarge",
+        "num_workers": 1,
+        "spark_conf": {
+          "spark.databricks.delta.preview.enabled": "true",
+          "spark.sql.adaptive.enabled": "false",
+          "spark.sql.adaptive.skewJoin.enabled": "false"
+        }
+      }
+    }
+  ],
+  "max_concurrent_runs": 1
+}

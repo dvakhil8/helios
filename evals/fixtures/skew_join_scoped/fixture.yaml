@@ -1,0 +1,52 @@
+id: skew_join_scoped
+version: 1
+description: |
+  5-task daily-revenue pipeline. Two ingests fan into a skew-join
+  aggregation, then downstream enrichment + dashboard publish. The
+  bottleneck is task `daily_revenue` (NULL-skew LEFT JOIN); other
+  tasks are fast and out-of-scope. Tests whether the agent can navigate
+  the DAG, identify the right task, and apply a fix without disturbing
+  the other tasks.
+
+# Defines the optimization boundary. The agent may inspect any task but
+# may only MODIFY tasks in `in_scope_task_keys`. Equivalence is checked
+# only against `output_tables`. Tier 3 measures only in-scope task runtime.
+scope:
+  in_scope_task_keys: [daily_revenue]
+  output_tables:
+    - "{{run_catalog}}.{{run_schema}}.stg_daily_revenue"
+  upstream_tables:
+    - "{{run_catalog}}.{{run_schema}}.stg_orders"
+    - "{{run_catalog}}.{{run_schema}}.stg_users"
+
+bug:
+  category: data_skew
+  root_cause: |
+    Task `daily_revenue` LEFT JOINs stg_orders to stg_users on user_id;
+    87% of orders have user_id=NULL → single-reducer hot partition.
+    Other tasks are unrelated and should not be modified.
+
+investigation:
+  required_tools:
+    - tool: get_job                        # must navigate the DAG
+    - tool: get_job_run                    # must read per-task durations
+    - tool: get_notebook_source            # must read the bottleneck notebook
+    - tool: execute_sql
+      sql_contains: "DESCRIBE DETAIL"
+    - tool: execute_sql
+      sql_contains: "GROUP BY"
+  expected_diagnosis_keywords:
+    - skew
+    - "null"
+    - daily_revenue                        # must name the bottleneck task
+
+fix:
+  acceptable_categories:
+    - filter_null_join_keys
+    - salted_join
+    - split_null_handling
+  expected_improvement:
+    runtime_pct_min: 20                    # scope = in-scope task only
+
+budget:
+  tool_calls_reference: 20

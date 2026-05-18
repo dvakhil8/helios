@@ -1,0 +1,47 @@
+id: skew_join_orders
+version: 3
+description: |
+  orders LEFT JOIN users on user_id, where ~87% of orders rows have
+  user_id = NULL. A single reducer ends up handling almost all the
+  shuffle output, so the daily-revenue aggregation that should be a
+  few seconds takes minutes.
+
+bug:
+  category: data_skew
+  root_cause: |
+    NULL-skewed join key on orders.user_id. The LEFT JOIN to users
+    sends all NULL rows to the same reducer, creating a hot partition
+    that dominates wall time.
+
+investigation:
+  # The agent should hit at least these tools to find the bug.
+  # Match by tool name; the `sql_contains` field is a substring hint for
+  # execute_sql calls (Tier 2 will check the trace against these).
+  required_tools:
+    - tool: get_job
+    - tool: list_job_runs
+    - tool: get_job_run
+    - tool: execute_sql
+      sql_contains: "DESCRIBE DETAIL"
+    - tool: execute_sql
+      sql_contains: "GROUP BY"        # skew detection on user_id
+    - tool: execute_sql
+      sql_contains: "EXPLAIN"
+  expected_diagnosis_keywords:
+    - skew
+    - "null"
+    - user_id
+
+fix:
+  acceptable_categories:
+    - filter_null_join_keys     # WHERE user_id IS NOT NULL before join
+    - salted_join                # add salt column to redistribute
+    - broadcast_users            # broadcast the small dim table
+    - split_null_handling        # union of NULL branch + non-NULL join
+  expected_improvement:
+    runtime_pct_min: 40
+    dbu_pct_min: 25
+    bytes_scanned_pct_min: 0
+
+budget:
+  tool_calls_reference: 12
