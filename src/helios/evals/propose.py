@@ -124,7 +124,12 @@ def get_prod_task_run_start_time(prod_job_id: int, task_key: str) -> str | None:
 
     Walks back through recent job runs (looking inside each for the named
     task) until it finds one where the task itself succeeded — even if the
-    parent run as a whole failed. Returns the ISO-formatted UTC timestamp
+    parent run as a whole failed OR is still RUNNING. A task that has already
+    reached SUCCESS has committed its write target; downstream tasks in the
+    same DAG write elsewhere and won't mutate it, so a finished task inside an
+    in-flight parent run is a valid (and fresher) alignment point. Hence we
+    list with completed_only=False and key off the *task's* terminal state,
+    not the parent run's lifecycle. Returns the ISO-formatted UTC timestamp
     Spark TIMESTAMP AS OF accepts, or None if no successful task run found.
     """
     seen_run_ids: set[int] = set()
@@ -132,7 +137,9 @@ def get_prod_task_run_start_time(prod_job_id: int, task_key: str) -> str | None:
     pages = 0
     while pages < 6:
         kwargs: dict[str, Any] = {
-            "job_id": prod_job_id, "completed_only": True, "limit": 25,
+            # completed_only=False so an in-flight parent run whose target
+            # task has *already* finished SUCCESS is still considered.
+            "job_id": prod_job_id, "completed_only": False, "limit": 25,
         }
         if cursor_ms is not None:
             kwargs["start_time_to_ms"] = cursor_ms - 1
@@ -152,6 +159,9 @@ def get_prod_task_run_start_time(prod_job_id: int, task_key: str) -> str | None:
                 if t.get("task_key") != task_key:
                     continue
                 state = (t.get("state") or {}).get("result_state")
+                # Accept the task only once it has terminally SUCCEEDED.
+                # A still-RUNNING task in the newest run yields state in
+                # {None, "RUNNING"} → skip, fall through to older runs.
                 if state == "SUCCESS":
                     start_ms = t.get("start_time") or r.get("start_time")
                     if start_ms:
@@ -769,6 +779,26 @@ def propose(
 
         # 3. Invoke agent with frozen prod job_id
         baseline_seconds = history.median_duration_ms / 1000
+
+        # Build the EXACT diff_tables command(s) the agent must run. The prod
+        # side MUST be pinned to the boundary version captured at clone time
+        # (`prod_boundary_versions`), NOT the live table — prod is a daily
+        # full-overwrite ETL, so the live table will have moved past the
+        # snapshot the sandbox was computed against. Injecting the concrete
+        # command removes all guessing (the agent previously hallucinated a
+        # non-existent `__boundary` table and fell back to unpinned live prod).
+        def _pinned_boundary_ref(fqn: str) -> str:
+            ver = clone.prod_boundary_versions.get(fqn)
+            return f"{fqn} VERSION AS OF {ver}" if ver is not None else fqn
+
+        _diff_pairs = list(zip(
+            clone.write_targets_original, clone.write_targets_sandbox
+        ))
+        diff_commands = "\n".join(
+            f'    diff_tables(table_a="{_pinned_boundary_ref(o)}", '
+            f'table_b="{s}")'
+            for o, s in _diff_pairs
+        )
         extra = _PROPOSE_INSTRUCTIONS.format(
             prod_job_id=prod_job_id, task_key=task_key,
             baseline_seconds=baseline_seconds,
@@ -776,6 +806,7 @@ def propose(
             write_targets_original=", ".join(clone.write_targets_original),
             write_targets_sandbox=", ".join(clone.write_targets_sandbox),
             sandbox_notebook_path=clone.sandbox_notebook_path,
+            diff_commands=diff_commands,
         )
         sandbox_output_fqn = clone.write_targets_sandbox[0] if clone.write_targets_sandbox else ""
         live_trace_path = proposal_dir / "trace.live.jsonl"
@@ -865,6 +896,10 @@ HARD CONSTRAINTS (do not violate these):
   - You may MODIFY only the sandbox notebook at:
         {sandbox_notebook_path}
     via `upload_notebook` (overwrite is fine).
+  - Equivalence is ALWAYS checked against the prod boundary pinned with
+    `VERSION AS OF` (the exact command is given verbatim in step 5 below).
+    Never diff against the live/unpinned prod table and never invent a
+    `*__boundary` / snapshot table — no such table exists.
   - Write targets {write_targets_original} are re-mapped to {write_targets_sandbox}
     in the sandbox notebook. Output must produce equivalent content to the
     cached prod snapshot. DO NOT change the SELECT columns / aggregations /
@@ -1029,19 +1064,36 @@ WHEN DONE — MANDATORY verification before declaring success:
      get_job_run_output on the task run_id to read the error, fix the
      notebook, and retry from step 2. Do not give up on a transient parse
      error or schema bug — those are part of the work.
-  5. *** REQUIRED *** — Call the `diff_tables` tool to verify row-level
-     equivalence between the sandbox output and the prod boundary table:
+  5. *** REQUIRED *** — Verify row-level equivalence by calling `diff_tables`
+     with EXACTLY this command (copy it verbatim — do not invent table names,
+     do not add suffixes like `__boundary`, do not look for a snapshot table):
 
-         diff_tables(table_a=<prod_boundary_table>, table_b=<sandbox_table>)
+{diff_commands}
+
+     `table_a` is the prod boundary PINNED to the exact Delta version the
+     baseline was produced at (`... VERSION AS OF <n>`). This is mandatory.
+       - DO NOT compare against the live/unpinned prod table (e.g.
+         `spice_catalog.prod.<t>` with no `VERSION AS OF`). Prod is a daily
+         full-overwrite ETL — the live table has already moved past the
+         snapshot your sandbox was computed from, so an unpinned compare is
+         apples-to-oranges and will report a FALSE `REAL_DIFFERENCE`.
+       - There is NO materialized `*__boundary` table. The pinned reference
+         above IS the boundary. If `diff_tables` returns TABLE_OR_VIEW_NOT_FOUND
+         you mistyped the command — re-copy it verbatim; do not go hunting
+         with SHOW TABLES / SHOW SCHEMAS.
 
      Read the returned `verdict`:
-       - "IDENTICAL"            → safe to declare success.
-       - "FLOAT_REORDER_ONLY"   → safe; the only drift is machine-epsilon
-                                  float-reorder noise on DOUBLE columns.
+       - "IDENTICAL"            → safe to declare success (any sub-tolerance
+                                  float drift was IEEE-754 reorder noise,
+                                  already absorbed).
+       - "FLOAT_REORDER_ONLY"   → safe; only DOUBLE/FLOAT columns drift and
+                                  `worst_float_rel_diff` is within the reorder
+                                  threshold. Cite it in your summary.
        - "REAL_DIFFERENCE"      → DO NOT declare success. The output is
-                                  semantically wrong. Read `buckets`,
-                                  `metric_summary`, and `drift_concentration`
-                                  to localize the broken CTE/join, fix your
+                                  semantically wrong. Read `drift_profile`
+                                  (per-column rows_drifted / max_rel_diff),
+                                  `buckets`, and `drift_concentration` to
+                                  localize the broken CTE/join, fix your
                                   notebook, and re-run from step 2.
 
      Coarse checks (COUNT(*), SUM of one column) are NOT sufficient — they
@@ -1608,7 +1660,10 @@ def finalize(
         )
         pinned_label = pinned_orig if pinned_orig != orig else orig
         console.print(f"[cyan]→ diff_tables({pinned_label}, {sb})[/]")
-        diff = diff_tables(table_a=pinned_orig, table_b=sb, timeout_seconds=1800)
+        diff = diff_tables(
+            table_a=pinned_orig, table_b=sb, timeout_seconds=1800,
+            ignore_columns=clone_meta.get("equivalence_ignore_columns") or None,
+        )
         per_table[orig] = diff
         if diff["verdict"] == "REAL_DIFFERENCE":
             all_eq = False

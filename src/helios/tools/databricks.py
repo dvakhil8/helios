@@ -862,10 +862,44 @@ DIFF_TABLES_SCHEMA: dict[str, Any] = {
                 "items": {"type": "string"},
                 "description": "Optional metric columns to compare. If omitted, auto-detected (all numeric columns).",
             },
-            "float_round_digits": {
-                "type": "integer",
-                "default": 6,
-                "description": "Round DOUBLE/FLOAT columns to this many decimal places before comparing (filters out float-reorder noise).",
+            "ignore_columns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Columns to exclude from BOTH the natural key and metric "
+                    "comparison — use for ETL run-stamps (last_refresh_time, "
+                    "loaded_at, batch_id, etc.) that differ every run by "
+                    "construction. Common refresh/load/etl timestamp names are "
+                    "auto-detected and excluded even if not listed here; the "
+                    "result reports `auto_ignored_columns` so you can verify."
+                ),
+            },
+            "rtol": {
+                "type": "number",
+                "default": 1e-9,
+                "description": (
+                    "Relative tolerance for DOUBLE/FLOAT columns. Two float "
+                    "cells are equal iff |a-b| <= atol + rtol*max(|a|,|b|). "
+                    "1e-9 is ~4 orders of magnitude above IEEE-754 reduction "
+                    "noise (~1e-13) and far below any real logic bug. "
+                    "DECIMAL/INT/string columns are ALWAYS compared exactly "
+                    "(tolerance never applies to them)."
+                ),
+            },
+            "atol": {
+                "type": "number",
+                "default": 1e-9,
+                "description": "Absolute tolerance for DOUBLE/FLOAT columns (handles values near zero). See rtol.",
+            },
+            "reorder_rel_threshold": {
+                "type": "number",
+                "default": 1e-6,
+                "description": (
+                    "If float cells exceed rtol/atol but the worst relative "
+                    "diff stays under this, the verdict is FLOAT_REORDER_ONLY "
+                    "(large-magnitude reorder, still negligible) rather than "
+                    "REAL_DIFFERENCE."
+                ),
             },
             "top_k_drift_dims": {
                 "type": "integer",
@@ -888,13 +922,23 @@ def diff_tables(
     table_b: str,
     natural_key: list[str] | None = None,
     metric_columns: list[str] | None = None,
-    float_round_digits: int = 6,
+    ignore_columns: list[str] | None = None,
+    rtol: float = 1e-9,
+    atol: float = 1e-9,
+    reorder_rel_threshold: float = 1e-6,
+    float_round_digits: int | None = None,  # DEPRECATED: superseded by rtol/atol
     top_k_drift_dims: int = 10,
     timeout_seconds: int = 1800,
 ) -> dict[str, Any]:
-    # Resolve schema from table_a (assume both have the same shape)
+    # Resolve schema from table_a (assume both have the same shape).
+    # DESCRIBE TABLE does NOT accept Delta time-travel (`VERSION/TIMESTAMP AS
+    # OF`) — that clause is only valid in SELECT ... FROM. Strip it for the
+    # schema lookup; the column list is version-independent for our purposes.
+    schema_ref = re.sub(
+        r"\s+(?:VERSION|TIMESTAMP)\s+AS\s+OF\s+.*$", "", table_a, flags=re.IGNORECASE
+    ).strip()
     cols_resp = execute_sql(
-        f"DESCRIBE TABLE {table_a}", row_limit=500, timeout_seconds=120
+        f"DESCRIBE TABLE {schema_ref}", row_limit=500, timeout_seconds=120
     )
     cols: list[tuple[str, str]] = []
     for row in cols_resp["rows"]:
@@ -928,10 +972,47 @@ def diff_tables(
         return any(ln.startswith(p) or ln.endswith("_" + p) or ln.endswith("_count")
                    or ln == "count" for p in _count_like_prefixes)
 
+    # ETL run-stamp columns: written with the job's run time / batch id, so
+    # they DIFFER on every run by construction. Including them in the natural
+    # key makes the FULL OUTER JOIN match nothing (100% extra/missing). They
+    # must be dropped from BOTH key and metrics — they're not part of the
+    # data's identity and aren't meaningful to compare. Matched conservatively:
+    # only well-known refresh/load/etl stamp names, not generic *_date / *_time
+    # (those are usually business dates that SHOULD be in the key).
+    _run_stamp_names = {
+        "last_refresh_time", "last_refresh_date", "refresh_time", "refresh_timestamp",
+        "last_updated", "last_updated_at", "updated_at", "updated_time", "update_timestamp",
+        "loaded_at", "load_timestamp", "load_time", "etl_timestamp", "etl_time",
+        "etl_loaded_at", "ingested_at", "ingestion_time", "ingestion_timestamp",
+        "inserted_at", "insert_timestamp", "processed_at", "process_timestamp",
+        "run_timestamp", "run_time", "_run_id", "batch_id", "batch_timestamp",
+        "dbt_updated_at", "dbt_loaded_at", "_loaded_at", "record_loaded_time",
+        "created_at", "create_time", "created_timestamp",
+    }
+    def looks_run_stamp(name: str) -> bool:
+        ln = name.lower().strip("`")
+        if ln in _run_stamp_names:
+            return True
+        # suffix patterns
+        return ln.endswith(("_refresh_time", "_refresh_date", "_loaded_at",
+                            "_etl_timestamp", "_run_timestamp", "_ingested_at"))
+
+    ignored = set(ignore_columns or [])
+    auto_ignored: list[str] = []
+    for n, t in cols:
+        if n in ignored:
+            continue
+        # Only auto-ignore temporal-typed columns whose name screams run-stamp.
+        if looks_run_stamp(n) and any(s in t for s in ("TIMESTAMP", "DATE")):
+            ignored.add(n)
+            auto_ignored.append(n)
+
+    usable_cols = [(n, t) for n, t in cols if n not in ignored]
+
     if natural_key is None and metric_columns is None:
         natural_key = []
         metric_columns = []
-        for n, t in cols:
+        for n, t in usable_cols:
             if is_float(t) or is_decimal(t):
                 metric_columns.append(n)
             elif is_integer(t):
@@ -942,24 +1023,52 @@ def diff_tables(
             else:
                 natural_key.append(n)
     elif natural_key is None:
-        natural_key = [n for n, t in cols if n not in metric_columns]
+        natural_key = [n for n, t in usable_cols if n not in metric_columns]
     elif metric_columns is None:
-        metric_columns = [n for n, t in cols if n not in natural_key]
+        metric_columns = [n for n, t in usable_cols if n not in natural_key]
+    # Honour explicit ignore even when caller passed key/metrics lists
+    natural_key = [c for c in natural_key if c not in ignored]
+    metric_columns = [c for c in metric_columns if c not in ignored]
 
-    # Column type lookup for float rounding
     col_types = dict(cols)
 
-    def metric_expr(table_alias: str, c: str) -> str:
-        if is_float(col_types.get(c, "")) and float_round_digits is not None:
-            return f"ROUND({table_alias}.`{c}`, {float_round_digits})"
-        return f"{table_alias}.`{c}`"
+    # IEEE-754 double addition is non-associative: a correct query rewrite that
+    # changes join/shuffle order produces bit-different DOUBLE sums (~1e-13
+    # relative). Fixed-decimal rounding is the wrong instrument — FP error is
+    # RELATIVE to magnitude, not absolute. Use a magnitude-aware tolerance
+    # (the numpy.isclose criterion) on DOUBLE/FLOAT only; DECIMAL/INT/string
+    # are compared EXACTLY (Spark DECIMAL arithmetic is exact & order-stable).
+    def _num(x: float) -> str:
+        return repr(float(x))
+
+    def cell_equal(c: str) -> str:
+        """SQL boolean: TRUE iff a.c and b.c are equal (tolerant for floats)."""
+        a, b = f"a.`{c}`", f"b.`{c}`"
+        if not is_float(col_types.get(c, "")):
+            return f"({a} <=> {b})"  # exact, null-safe (DECIMAL/INT/string)
+        return (
+            f"( ({a} IS NULL AND {b} IS NULL) "
+            f"OR ({a} IS NOT NULL AND {b} IS NOT NULL AND ( "
+            f"(isnan({a}) AND isnan({b})) "
+            f"OR abs({a} - {b}) <= "
+            f"({_num(atol)} + {_num(rtol)} * greatest(abs({a}), abs({b}))) )) )"
+        )
+
+    def cell_diff(c: str) -> str:
+        return f"(NOT {cell_equal(c)})"
 
     join_cond = " AND ".join(f"a.`{k}` <=> b.`{k}`" for k in natural_key)
 
+    # Wrap both tables in `(SELECT * FROM ...)` so a Delta time-travel suffix
+    # (`VERSION/TIMESTAMP AS OF`) can be aliased. `FROM tbl VERSION AS OF 5 a`
+    # mis-parses the alias; `FROM (SELECT * FROM tbl VERSION AS OF 5) a` is
+    # robust. Spark's optimizer flattens the trivial subquery — no perf cost.
+    ta = f"(SELECT * FROM {table_a})"
+    tb = f"(SELECT * FROM {table_b})"
+
     # 1. Categorize every row
     metric_diff_clauses = " OR ".join(
-        f"({metric_expr('a', c)} <=> {metric_expr('b', c)}) = false"
-        for c in metric_columns
+        cell_diff(c) for c in metric_columns
     ) or "false"
 
     bucket_case = f"""
@@ -973,7 +1082,7 @@ def diff_tables(
     bucket_sql = f"""
     WITH joined AS (
       SELECT {bucket_case} AS bucket
-      FROM {table_a} a FULL OUTER JOIN {table_b} b ON {join_cond}
+      FROM {ta} a FULL OUTER JOIN {tb} b ON {join_cond}
     )
     SELECT bucket, COUNT(*) AS n FROM joined GROUP BY 1
     """
@@ -992,28 +1101,34 @@ def diff_tables(
         sums_b = ", ".join(
             f"CAST(SUM(`{c}`) AS DOUBLE) AS b_sum_{c}" for c in metric_columns
         )
-        # Per-row drift counts (with rounding for floats)
-        per_col_diff_counts = ", ".join(
-            f"SUM(CASE WHEN ({metric_expr('a', c)} <=> {metric_expr('b', c)}) = false THEN 1 ELSE 0 END) AS diff_{c}"
-            for c in metric_columns
-        )
-        summary_sql = f"""
-        SELECT
-            (SELECT {sums_a} FROM {table_a}) AS a_totals,
-            (SELECT {sums_b} FROM {table_b}) AS b_totals,
-            x.*
-        FROM (
-            SELECT {per_col_diff_counts}
-            FROM {table_a} a JOIN {table_b} b ON {join_cond}
-        ) x
-        """
-        # The above produces a single row but is awkward with nested struct selects.
-        # Use a simpler shape: just per-table sums + per-column drift counts.
-        sums_a_sql = f"SELECT {sums_a} FROM {table_a}"
-        sums_b_sql = f"SELECT {sums_b} FROM {table_b}"
+        # Per-column drift count + (float only) drift PROFILE: worst absolute
+        # and worst RELATIVE diff among the rows that actually exceeded
+        # tolerance. This makes the verdict evidence-based — "max rel 3e-13"
+        # is obviously reorder noise; "max rel 0.4" is a real bug.
+        _diff_parts: list[str] = []
+        for c in metric_columns:
+            _diff_parts.append(
+                f"SUM(CASE WHEN {cell_diff(c)} THEN 1 ELSE 0 END) AS diff_{c}"
+            )
+            if is_float(col_types.get(c, "")):
+                a, b = f"a.`{c}`", f"b.`{c}`"
+                _diff_parts.append(
+                    f"MAX(CASE WHEN {cell_diff(c)} THEN abs({a} - {b}) END) "
+                    f"AS maxabs_{c}"
+                )
+                _diff_parts.append(
+                    f"MAX(CASE WHEN {cell_diff(c)} "
+                    f"AND greatest(abs({a}), abs({b})) > 0 "
+                    f"THEN abs({a} - {b}) / greatest(abs({a}), abs({b})) END) "
+                    f"AS maxrel_{c}"
+                )
+        per_col_diff_counts = ", ".join(_diff_parts)
+        # Per-table sums + per-column drift counts (kept as separate queries).
+        sums_a_sql = f"SELECT {sums_a} FROM {ta}"
+        sums_b_sql = f"SELECT {sums_b} FROM {tb}"
         diff_counts_sql = (
             f"SELECT {per_col_diff_counts} "
-            f"FROM {table_a} a JOIN {table_b} b ON {join_cond}"
+            f"FROM {ta} a JOIN {tb} b ON {join_cond}"
         )
         a_totals = execute_sql(sums_a_sql, timeout_seconds=timeout_seconds)["rows"][0]
         b_totals = execute_sql(sums_b_sql, timeout_seconds=timeout_seconds)["rows"][0]
@@ -1029,7 +1144,7 @@ def diff_tables(
                 rel = (delta / a_f) if (delta is not None and a_f) else None
             except (TypeError, ValueError):
                 a_f = b_f = delta = rel = None
-            metric_summary[c] = {
+            entry: dict[str, Any] = {
                 "type": col_types.get(c),
                 "is_float": is_float(col_types.get(c, "")),
                 "rows_drifted": int(diff_counts.get(f"diff_{c}") or 0),
@@ -1038,6 +1153,18 @@ def diff_tables(
                 "total_delta": delta,
                 "total_delta_relative": rel,
             }
+            if entry["is_float"]:
+                ma = diff_counts.get(f"maxabs_{c}")
+                mr = diff_counts.get(f"maxrel_{c}")
+                try:
+                    entry["max_abs_diff"] = float(ma) if ma is not None else None
+                except (TypeError, ValueError):
+                    entry["max_abs_diff"] = None
+                try:
+                    entry["max_rel_diff"] = float(mr) if mr is not None else None
+                except (TypeError, ValueError):
+                    entry["max_rel_diff"] = None
+            metric_summary[c] = entry
 
     # 3. Top-K dimension concentrations for non-identical rows
     drift_concentration: dict[str, list[dict[str, Any]]] = {}
@@ -1054,7 +1181,7 @@ def diff_tables(
                 top = execute_sql(
                     f"""
                     SELECT {ref_table}.{first_dim} AS dim_value, COUNT(*) AS n
-                    FROM {table_a} a FULL OUTER JOIN {table_b} b ON {join_cond}
+                    FROM {ta} a FULL OUTER JOIN {tb} b ON {join_cond}
                     WHERE {where_clause}
                     GROUP BY {ref_table}.{first_dim}
                     ORDER BY n DESC
@@ -1068,43 +1195,83 @@ def diff_tables(
             except Exception as e:
                 drift_concentration[which_bucket] = [{"error": str(e)}]
 
-    # 4. Interpretation — classify the overall result
+    # 4. Interpretation — evidence-based, driven by the drift profile.
+    #   rows_drifted now means "cells that EXCEEDED rtol/atol tolerance"
+    #   (sub-tolerance FP-reorder noise is absorbed into 'identical').
     real_drift_cols = [
         c for c, m in metric_summary.items()
         if (not m["is_float"]) and m["rows_drifted"] > 0
     ]
-    float_only_drift = (
-        any(m["rows_drifted"] > 0 and m["is_float"] for m in metric_summary.values())
-        and not real_drift_cols
-    )
+    float_drift_cols = [
+        c for c, m in metric_summary.items()
+        if m["is_float"] and m["rows_drifted"] > 0
+    ]
+    # Worst relative diff among float columns that exceeded tolerance.
+    worst_float_rel = max(
+        (metric_summary[c].get("max_rel_diff") or 0.0) for c in float_drift_cols
+    ) if float_drift_cols else 0.0
     structural_drift = buckets["extra_in_b"] > 0 or buckets["missing_from_b"] > 0
+
+    # Compact profile for humans / proposal.md.
+    drift_profile = [
+        {
+            "column": c,
+            "type": metric_summary[c]["type"],
+            "rows_drifted": metric_summary[c]["rows_drifted"],
+            "max_abs_diff": metric_summary[c].get("max_abs_diff"),
+            "max_rel_diff": metric_summary[c].get("max_rel_diff"),
+        }
+        for c in (real_drift_cols + float_drift_cols)
+    ]
 
     if structural_drift or real_drift_cols:
         verdict = "REAL_DIFFERENCE"
         interp = (
             "Real semantic drift detected: "
-            + (f"{buckets['extra_in_b']} extra rows in B, {buckets['missing_from_b']} missing. "
-               if structural_drift else "")
-            + (f"Non-float metric columns drift: {real_drift_cols}. " if real_drift_cols else "")
+            + (f"{buckets['extra_in_b']} extra rows in B, "
+               f"{buckets['missing_from_b']} missing. " if structural_drift else "")
+            + (f"Exact (DECIMAL/INT/string) columns drift: {real_drift_cols}. "
+               if real_drift_cols else "")
             + "Tables are NOT equivalent."
         )
-    elif float_only_drift:
+    elif float_drift_cols and worst_float_rel > reorder_rel_threshold:
+        verdict = "REAL_DIFFERENCE"
+        interp = (
+            f"Float columns {float_drift_cols} exceed tolerance with worst "
+            f"relative diff {worst_float_rel:.3e} (> reorder threshold "
+            f"{reorder_rel_threshold:.0e}). Too large for FP-reorder noise — "
+            "the optimized query's arithmetic is genuinely different."
+        )
+    elif float_drift_cols:
         verdict = "FLOAT_REORDER_ONLY"
         interp = (
-            "Only DOUBLE/FLOAT columns drift, all within machine-epsilon scale. "
-            "Likely just aggregation-reorder noise. Tables are functionally equivalent."
+            f"Only DOUBLE/FLOAT columns {float_drift_cols} differ, worst "
+            f"relative diff {worst_float_rel:.3e} (<= {reorder_rel_threshold:.0e}). "
+            "Consistent with IEEE-754 aggregation-reorder noise — functionally "
+            "equivalent."
         )
     else:
         verdict = "IDENTICAL"
-        interp = "Tables are byte-identical (after float rounding)."
+        interp = (
+            f"Equivalent within tolerance (rtol={rtol:.0e}, atol={atol:.0e}); "
+            "any sub-tolerance float drift is IEEE-754 reorder noise."
+        )
 
     return {
         "table_a": table_a,
         "table_b": table_b,
         "natural_key": natural_key,
         "metric_columns": metric_columns,
+        "ignored_columns": sorted(ignored),
+        "auto_ignored_columns": auto_ignored,
+        "tolerance": {
+            "rtol": rtol, "atol": atol,
+            "reorder_rel_threshold": reorder_rel_threshold,
+        },
         "buckets": buckets,
         "metric_summary": metric_summary,
+        "drift_profile": drift_profile,
+        "worst_float_rel_diff": worst_float_rel,
         "drift_concentration": drift_concentration,
         "verdict": verdict,
         "interpretation": interp,
