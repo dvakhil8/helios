@@ -45,7 +45,6 @@ from ..tools.databricks import (
 from . import baselines, sandbox
 from .baselines import _hash_output_table, compute_stats_fingerprint
 from .runner import run_agent
-from .scorers.correctness import _build_diff_report
 from .scorers.diagnosis import score as score_tier2_eval
 
 
@@ -852,10 +851,14 @@ def propose(
                 "duration_ms": optimized_ms,
                 "run_page_url": opt_result.get("run_page_url"),
             }
-            summary["scores"] = _score_proposal(
+            _sc = _score_proposal(
                 history=history, clone=clone, optimized_succeeded=optimized_succeeded,
                 optimized_ms=optimized_ms, agent_result=agent_result,
+                proposal_dir=proposal_dir, console=console,
             )
+            summary["scores"] = {"tier1": _sc["tier1"], "tier3": _sc["tier3"]}
+            summary["nondeterminism"] = _sc["nondeterminism"]
+            summary["tier1_full_detail"] = _sc["tier1_full_detail"]
         else:
             summary["optimized_run"] = {"skipped": "agent_failed"}
             summary["scores"] = {
@@ -967,6 +970,18 @@ OPTIMIZATION PRIORITY ORDER — try in this sequence, stop when you find a real 
     • /*+ REPARTITION(N, key) */ — when you need stable partitioning before
       a multi-stage operation.
     • /*+ COALESCE(N) */ — to merge small partitions, reducing task overhead.
+    • /*+ RANGE_JOIN(rel, bin_size) */ — when a join has an INTERVAL /
+      INEQUALITY condition (BETWEEN, <, >, point-in-range, interval overlap)
+      with no equality key. Without the hint, Spark falls back to
+      BroadcastNestedLoopJoin / O(n·m) scan; with it, Databricks bins both
+      sides along the range column and turns the work into ~linear. Same
+      results — diff_tables stays IDENTICAL. `bin_size` matches the typical
+      interval length in the COLUMN's units: timestamps-as-seconds with
+      ~1-hour intervals → 3600; dates with ~month ranges → 30; numeric
+      ranges → typical span of [low, high]. Order-of-magnitude is enough.
+      Databricks' optimizer often suggests this directly in the run hints
+      ("This query has a join condition that can benefit from range join
+      optimization"); if you see that, apply it.
 
   ── Category 3: CACHING (no algebra change, but uses memory) ──
     • CACHE TABLE / .cache() / .persist() — when the SAME intermediate result
@@ -1112,42 +1127,6 @@ WHEN DONE — MANDATORY verification before declaring success:
 """
 
 
-def _classify_per_table_entry(entry: dict[str, Any]) -> str:
-    """Classify a per-table equivalence entry into one of:
-      IDENTICAL              — row + hash match exactly (or stats_only fully matched)
-      FLOAT_REORDER_ONLY     — row match, hash differs, diff_report says machine-epsilon only
-      REAL_DIFFERENCE        — row mismatch, or diff_report flags non-float drift
-      UNKNOWN                — couldn't determine
-
-    Matches the verdict vocabulary used by the diff_tables tool, so a single
-    classifier covers both `_score_proposal` (hash-based) and `_score_resume`
-    (diff_tables-based) paths.
-    """
-    if "error" in entry:
-        return "REAL_DIFFERENCE"
-    # diff_tables path already provides a verdict
-    if "verdict" in entry and entry["verdict"] in {"IDENTICAL", "FLOAT_REORDER_ONLY", "REAL_DIFFERENCE"}:
-        return entry["verdict"]
-    # full_hash path
-    row_match = entry.get("row_match")
-    hash_match = entry.get("hash_match")
-    if row_match and hash_match:
-        return "IDENTICAL"
-    if not row_match:
-        return "REAL_DIFFERENCE"
-    # row_match True but hash_match False — defer to diff_report
-    diff = entry.get("diff_report") or {}
-    interp = " ".join(diff.get("interpretation") or [])
-    if "REAL DIFFERENCE" in interp:
-        return "REAL_DIFFERENCE"
-    if "FLOAT-REORDER" in interp or "FLOAT_REORDER" in interp:
-        return "FLOAT_REORDER_ONLY"
-    # stats_only path
-    if entry.get("mode") == "stats_only":
-        return "IDENTICAL" if entry.get("stats_match") else "REAL_DIFFERENCE"
-    return "UNKNOWN"
-
-
 def _aggregate_verdict(verdicts: list[str]) -> str:
     """Worst-of across per-table verdicts. REAL_DIFFERENCE dominates;
     UNKNOWN is treated as REAL_DIFFERENCE for safety."""
@@ -1160,87 +1139,171 @@ def _aggregate_verdict(verdicts: list[str]) -> str:
     return "IDENTICAL"
 
 
+def _equivalence_and_nd(
+    *,
+    write_orig: list[str],
+    write_sb: list[str],
+    prod_boundary_versions: dict[str, int],
+    explicit_ignore: list[str],
+    proposal_dir: Path,
+    console: Console,
+    optimized_succeeded: bool = True,
+) -> dict[str, Any]:
+    """Single source of truth for Tier-1 equivalence across propose /
+    propose-resume / propose-finalize.
+
+    1. LLM nondeterminism analysis on the ORIGINAL canonical notebook.
+    2. Effective ignore = human-confirmed explicit list ∪ LLM
+       self-authorizing/already-handled. probe_required is NEVER
+       auto-excluded (data-derived, indistinguishable from a real bug) —
+       only surfaced for the determinism probe / human sign-off.
+    3. diff_tables per boundary table, prod side pinned to its captured
+       Delta version.
+
+    Returns {per_table, all_eq, nondeterminism}.
+    """
+    from ..tools.databricks import diff_tables, execute_sql
+
+    if not optimized_succeeded:
+        return {"per_table": {}, "all_eq": False, "nondeterminism": {}}
+
+    # 1. Nondeterminism analysis (graceful: never breaks scoring).
+    nd_analysis: dict[str, Any] = {}
+    orig_sql_path = proposal_dir / "notebook_original.txt"
+    if orig_sql_path.exists():
+        try:
+            from .nondeterminism import detect_nondeterministic_columns
+            orig_sql = orig_sql_path.read_text()
+            for orig in write_orig:
+                schema_ref = re.sub(
+                    r"\s+(?:VERSION|TIMESTAMP)\s+AS\s+OF\s+.*$", "", orig,
+                    flags=re.IGNORECASE,
+                ).strip()
+                drows = execute_sql(
+                    f"DESCRIBE TABLE {schema_ref}", row_limit=500,
+                    timeout_seconds=120,
+                )["rows"]
+                ocols: list[str] = []
+                for r in drows:
+                    n = (r.get("col_name") or "").strip()
+                    if not n or n.startswith("#"):
+                        break
+                    ocols.append(n)
+                console.print(
+                    f"[cyan]→ analyzing nondeterminism on {len(ocols)} "
+                    f"output columns of {orig}[/]"
+                )
+                nd_analysis[orig] = detect_nondeterministic_columns(
+                    orig_sql, ocols
+                )
+        except Exception as e:
+            console.print(
+                f"[yellow]nondeterminism analysis skipped: "
+                f"{type(e).__name__}: {e}[/]"
+            )
+            nd_analysis = {}
+    else:
+        console.print(
+            "[yellow]notebook_original.txt missing — skipping nondeterminism "
+            "analysis[/]"
+        )
+
+    # 2 + 3. Effective ignore + diff_tables per boundary table.
+    per_table: dict[str, Any] = {}
+    all_eq = True
+    for orig, sb in zip(write_orig, write_sb):
+        pinned_orig = (
+            f"{orig} VERSION AS OF {prod_boundary_versions[orig]}"
+            if orig in prod_boundary_versions
+            else orig
+        )
+        pinned_label = pinned_orig if pinned_orig != orig else orig
+        nd = nd_analysis.get(orig, {})
+        auto_safe = list(nd.get("self_authorizing_columns") or []) + list(
+            nd.get("already_handled_columns") or []
+        )
+        effective_ignore = sorted(set(explicit_ignore) | set(auto_safe))
+        probe_required = list(nd.get("probe_required_columns") or [])
+        if auto_safe:
+            console.print(
+                f"    [dim]auto-ignored (self-authorizing): {auto_safe}[/]"
+            )
+        if probe_required:
+            console.print(
+                f"    [yellow]probe-required nondeterminism (NOT excluded — "
+                f"needs determinism probe / human sign-off): "
+                f"{probe_required}[/]"
+            )
+        console.print(f"[cyan]→ diff_tables({pinned_label}, {sb})[/]")
+        diff = diff_tables(
+            table_a=pinned_orig, table_b=sb, timeout_seconds=1800,
+            ignore_columns=effective_ignore or None,
+        )
+        diff["effective_ignore_columns"] = effective_ignore
+        diff["nondeterminism_probe_required"] = probe_required
+        per_table[orig] = diff
+        if diff["verdict"] == "REAL_DIFFERENCE":
+            all_eq = False
+        console.print(
+            f"    verdict: {diff['verdict']} | "
+            f"identical {diff['buckets']['identical']:,} | "
+            f"extras {diff['buckets']['extra_in_b']:,} | "
+            f"missing {diff['buckets']['missing_from_b']:,} | "
+            f"drifted {diff['buckets']['same_key_drifted_metric']:,}"
+        )
+    return {
+        "per_table": per_table, "all_eq": all_eq,
+        "nondeterminism": nd_analysis,
+    }
+
+
+def _tier1_from_equivalence(eq: dict[str, Any]) -> dict[str, Any]:
+    """Build the uniform tier1 score dict from `_equivalence_and_nd` output.
+    Shape is a superset accepted by BOTH renderers."""
+    per_table = eq["per_table"]
+    verdicts = [v["verdict"] for v in per_table.values()]
+    agg = _aggregate_verdict(verdicts) if verdicts else "UNKNOWN"
+    return {
+        "tier": 1,
+        "passed": eq["all_eq"] and bool(per_table),
+        "equivalence_verdict": agg,
+        "per_table": {
+            k: {"verdict": v["verdict"], "buckets": v["buckets"],
+                "drift_concentration": v.get("drift_concentration", {})}
+            for k, v in per_table.items()
+        },
+        "details": {"per_table": per_table},
+    }
+
+
 def _score_proposal(
     *, history: HistoryBaseline, clone: TaskCloneResult,
     optimized_succeeded: bool, optimized_ms: int, agent_result,
+    proposal_dir: Path, console: Console,
 ) -> dict[str, Any]:
-    """Score the proposal — simplified T1 + T3. Tier 2 disabled for now since
-    there's no fixture-defined required_tools (could be inferred later)."""
-    # Tier 1 — strict per-table equivalence on the boundary write targets.
-    # If the prod snapshot has a full hash, compare against it. If snapshot is
-    # stats-only (hash timed out at snapshot time), fall back to stats-only
-    # equivalence: row_count + every column's sum/min/max/null_count must match.
-    per_table: dict[str, Any] = {}
-    per_table_verdicts: list[str] = []
-    if optimized_succeeded:
-        for orig_fqn, sb_fqn in zip(clone.write_targets_original, clone.write_targets_sandbox):
-            base_info = history.output_table_stats.get(orig_fqn, {})
-            if "error" in base_info:
-                per_table[orig_fqn] = {"error": "no prod snapshot available", "verdict": "REAL_DIFFERENCE"}
-                per_table_verdicts.append("REAL_DIFFERENCE")
-                continue
-            mode = base_info.get("snapshot_mode")
-            try:
-                if mode == "full_hash":
-                    opt_rows, opt_hash = _hash_output_table(sb_fqn, timeout_seconds=1800)
-                    row_match = opt_rows == base_info["row_count"]
-                    hash_match = opt_hash == base_info["hash"]
-                    entry = {
-                        "mode": "full_hash",
-                        "row_match": row_match, "hash_match": hash_match,
-                        "baseline_rows": base_info["row_count"], "optimized_rows": opt_rows,
-                        "baseline_hash": base_info["hash"], "optimized_hash": opt_hash,
-                        "sandbox_fqn": sb_fqn,
-                    }
-                    if not hash_match:
-                        entry["diff_report"] = _build_diff_report(
-                            baseline_stats=base_info.get("stats") or {}, opt_fqn=sb_fqn,
-                        )
-                else:
-                    # stats-only fallback
-                    opt_rc = int(execute_sql(
-                        f"SELECT COUNT(*) AS c FROM {sb_fqn}", timeout_seconds=600
-                    )["rows"][0]["c"])
-                    row_match = opt_rc == base_info["row_count"]
-                    diff = _build_diff_report(baseline_stats=base_info.get("stats") or {}, opt_fqn=sb_fqn)
-                    interp = " ".join(diff.get("interpretation") or [])
-                    stats_match = ("REAL DIFFERENCE" not in interp) and row_match
-                    entry = {
-                        "mode": "stats_only",
-                        "row_match": row_match,
-                        "stats_match": stats_match,
-                        "baseline_rows": base_info["row_count"], "optimized_rows": opt_rc,
-                        "sandbox_fqn": sb_fqn,
-                        "diff_report": diff,
-                        "note": "Full row-hash unavailable; equivalence judged on aggregates only.",
-                    }
-            except Exception as e:
-                per_table[orig_fqn] = {
-                    "error": f"sandbox hash failed: {e}", "sandbox_fqn": sb_fqn,
-                    "verdict": "REAL_DIFFERENCE",
-                }
-                per_table_verdicts.append("REAL_DIFFERENCE")
-                continue
+    """Score the proposal — T1 (canonical diff_tables + LLM nondeterminism)
+    + T3. Tier 2 disabled for propose (no fixture-defined required_tools).
 
-            # Classify: IDENTICAL / FLOAT_REORDER_ONLY / REAL_DIFFERENCE
-            entry["verdict"] = _classify_per_table_entry(entry)
-            per_table[orig_fqn] = entry
-            per_table_verdicts.append(entry["verdict"])
-    else:
-        per_table_verdicts.append("REAL_DIFFERENCE")
-
-    overall_verdict = _aggregate_verdict(per_table_verdicts) if per_table_verdicts else "UNKNOWN"
-    # PASS for IDENTICAL or FLOAT_REORDER_ONLY (machine-epsilon noise on doubles).
-    # FAIL for REAL_DIFFERENCE or UNKNOWN.
-    output_equivalent = overall_verdict in ("IDENTICAL", "FLOAT_REORDER_ONLY")
-    tier1 = {
-        "tier": 1,
-        "passed": output_equivalent and optimized_succeeded,
-        "output_equivalence": output_equivalent,
-        "equivalence_verdict": overall_verdict,  # IDENTICAL | FLOAT_REORDER_ONLY | REAL_DIFFERENCE
-        "job_completion": optimized_succeeded,
-        "details": {"per_table": per_table},
-    }
+    Tier-1 routes through the shared `_equivalence_and_nd` helper so propose
+    / propose-resume / propose-finalize stay consistent. The legacy
+    hash-based path was retired: a bit-sensitive full-table hash cannot
+    ignore columns, so it false-failed on float reorder AND nondeterminism.
+    """
+    eq = _equivalence_and_nd(
+        write_orig=clone.write_targets_original,
+        write_sb=clone.write_targets_sandbox,
+        prod_boundary_versions=clone.prod_boundary_versions or {},
+        explicit_ignore=[],  # fresh run: no human-confirmed list yet
+        proposal_dir=proposal_dir,
+        console=console,
+        optimized_succeeded=optimized_succeeded,
+    )
+    tier1 = _tier1_from_equivalence(eq)
+    tier1["output_equivalence"] = tier1["equivalence_verdict"] in (
+        "IDENTICAL", "FLOAT_REORDER_ONLY"
+    )
+    tier1["passed"] = tier1["passed"] and tier1["output_equivalence"]
+    tier1["job_completion"] = optimized_succeeded
 
     # Tier 3 — improvement vs baseline median.
     if optimized_succeeded and history.median_duration_ms > 0:
@@ -1255,7 +1318,63 @@ def _score_proposal(
         "runtime_improvement_pct": round(delta_pct, 2),
     }
 
-    return {"tier1": tier1, "tier3": tier3}
+    return {
+        "tier1": tier1,
+        "tier3": tier3,
+        "nondeterminism": eq["nondeterminism"],
+        "tier1_full_detail": eq["per_table"],
+    }
+
+
+def _render_nd_section(summary: dict[str, Any]) -> str:
+    """Shared LLM-nondeterminism markdown block — used by BOTH the propose
+    and finalize/resume renderers so all three commands report it."""
+    nd_all = summary.get("nondeterminism") or {}
+    full_detail = summary.get("tier1_full_detail") or {}
+    if not nd_all:
+        return ""
+    out = "\n## Nondeterministic output columns (LLM analysis of original query)\n\n"
+    for orig, nd in nd_all.items():
+        cols = nd.get("columns") or {}
+        flagged = nd.get("nondeterministic_columns") or []
+        if not flagged:
+            out += (
+                f"`{orig}`: no nondeterministic output columns detected — "
+                f"all values are pure functions of the pinned inputs.\n\n"
+            )
+            continue
+        eff = (full_detail.get(orig, {}) or {}).get(
+            "effective_ignore_columns", []
+        )
+        out += (
+            f"`{orig}` — model `{nd.get('model', '?')}`:\n\n"
+            "| Column | Class | Authorization | Excluded from diff? | Rationale |\n"
+            "|---|---|---|---|---|\n"
+        )
+        for c in flagged:
+            e = cols.get(c, {})
+            excluded = "✅ yes" if c in eff else "❌ no (needs probe)"
+            rat = (e.get("rationale") or "").replace("|", "\\|")
+            out += (
+                f"| `{c}` | {e.get('class')} | "
+                f"{e.get('authorization')} | {excluded} | {rat} |\n"
+            )
+        probe = (full_detail.get(orig, {}) or {}).get(
+            "nondeterminism_probe_required", []
+        )
+        if probe:
+            out += (
+                f"\n> ⚠️ **{len(probe)} column(s) flagged probe-required** "
+                f"({', '.join(f'`{c}`' for c in probe)}): data-derived "
+                "nondeterminism (e.g. untied argmax). NOT auto-excluded — "
+                "structurally indistinguishable from a real bug. If Tier 1 "
+                "is REAL_DIFFERENCE *solely* due to these, confirm via the "
+                "determinism probe (run the original notebook on the same "
+                "pinned inputs) before adding them to "
+                "`equivalence_ignore_columns` in `clone.json`.\n"
+            )
+        out += "\n"
+    return out
 
 
 def _render_proposal_md(
@@ -1342,7 +1461,7 @@ def _render_proposal_md(
 {chr(10).join(f"| `{orig}` | `{sb}` |" for orig, sb in zip(clone.write_targets_original, clone.write_targets_sandbox))}
 
 {boundary_summary}
-
+{_render_nd_section(summary)}
 ## Diff: what the agent changed
 
 ```diff
@@ -1489,15 +1608,21 @@ def resume(
         # Aliases the markdown renderer expects (same shape as finalize)
         summary["scored_run_id"] = opt.get("run_id")
         summary["scored_run_exec_ms"] = opt_ms
-        # Score via diff_tables + Tier 3 — pin prod boundary to clone-time version
-        summary["scores"] = _score_resume(
+        # Score via shared equivalence+nondeterminism helper + Tier 3
+        _sc = _score_resume(
             baseline_seconds=baseline_seconds,
             optimized_ms=opt_ms,
             write_orig=write_targets_original,
             write_sb=clone_meta["write_targets_sandbox"],
             optimized_succeeded=succeeded,
+            proposal_dir=proposal_dir,
+            console=console,
             prod_boundary_versions=clone_meta.get("prod_boundary_versions") or {},
+            explicit_ignore=list(clone_meta.get("equivalence_ignore_columns") or []),
         )
+        summary["scores"] = {"tier1": _sc["tier1"], "tier3": _sc["tier3"]}
+        summary["nondeterminism"] = _sc["nondeterminism"]
+        summary["tier1_full_detail"] = _sc["tier1_full_detail"]
 
     (proposal_dir / "proposal.json").write_text(json.dumps(summary, indent=2, default=str))
     md = _render_finalize_md(summary=summary, clone_meta=clone_meta, proposal_dir=proposal_dir)
@@ -1515,53 +1640,37 @@ def _score_resume(
     write_orig: list[str],
     write_sb: list[str],
     optimized_succeeded: bool,
+    proposal_dir: Path,
+    console: Console,
     prod_boundary_versions: dict[str, int] | None = None,
+    explicit_ignore: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Score a resume run — same shape as finalize's scoring.
-
-    `prod_boundary_versions` (optional): {fqn: version} captured at clone time.
-    When provided, diff_tables compares the sandbox output against the prod
-    boundary AT THAT SPECIFIC VERSION (via Delta time-travel), so a refresh
-    of prod during the experiment doesn't cause spurious mismatches.
-    """
-    from ..tools.databricks import diff_tables
-    prod_boundary_versions = prod_boundary_versions or {}
-    per_table: dict[str, Any] = {}
-    all_eq = True
-    if optimized_succeeded:
-        for orig, sb in zip(write_orig, write_sb):
-            # Pin prod side to the captured version (Delta time-travel) if known.
-            pinned_orig = (
-                f"{orig} VERSION AS OF {prod_boundary_versions[orig]}"
-                if orig in prod_boundary_versions
-                else orig
-            )
-            diff = diff_tables(table_a=pinned_orig, table_b=sb, timeout_seconds=1800)
-            per_table[orig] = diff
-            if diff["verdict"] == "REAL_DIFFERENCE":
-                all_eq = False
-    else:
-        all_eq = False
+    """Score a resume run via the shared equivalence+nondeterminism helper —
+    identical Tier-1 semantics to propose / propose-finalize."""
+    eq = _equivalence_and_nd(
+        write_orig=write_orig,
+        write_sb=write_sb,
+        prod_boundary_versions=prod_boundary_versions or {},
+        explicit_ignore=list(explicit_ignore or []),
+        proposal_dir=proposal_dir,
+        console=console,
+        optimized_succeeded=optimized_succeeded,
+    )
+    tier1 = _tier1_from_equivalence(eq)
     runtime_pct = 0.0
     base_ms = int(baseline_seconds * 1000)
     if optimized_succeeded and optimized_ms > 0 and base_ms > 0:
         runtime_pct = (base_ms - optimized_ms) / base_ms * 100
     return {
-        "tier1": {
-            "passed": all_eq,
-            "per_table": {
-                k: {"verdict": v["verdict"],
-                    "buckets": v["buckets"],
-                    "drift_concentration": v.get("drift_concentration", {})}
-                for k, v in per_table.items()
-            },
-        },
+        "tier1": tier1,
         "tier3": {
             "passed": runtime_pct >= 15.0,
             "runtime_improvement_pct": round(runtime_pct, 2),
             "baseline_duration_ms": base_ms,
             "optimized_duration_ms": optimized_ms,
         },
+        "nondeterminism": eq["nondeterminism"],
+        "tier1_full_detail": eq["per_table"],
     }
 
 
@@ -1647,33 +1756,19 @@ def finalize(
         console.print(f"  baseline median {baseline['median_duration_ms']/1000:.0f}s")
     summary["baseline"] = baseline
 
-    # 3. Tier 1 via diff_tables (the canonical row-level check) — pin prod
-    # boundary to its captured version (if known) for stable comparison.
-    prod_boundary_versions = clone_meta.get("prod_boundary_versions") or {}
-    per_table: dict[str, Any] = {}
-    all_eq = True
-    for orig, sb in zip(write_orig, write_sb):
-        pinned_orig = (
-            f"{orig} VERSION AS OF {prod_boundary_versions[orig]}"
-            if orig in prod_boundary_versions
-            else orig
-        )
-        pinned_label = pinned_orig if pinned_orig != orig else orig
-        console.print(f"[cyan]→ diff_tables({pinned_label}, {sb})[/]")
-        diff = diff_tables(
-            table_a=pinned_orig, table_b=sb, timeout_seconds=1800,
-            ignore_columns=clone_meta.get("equivalence_ignore_columns") or None,
-        )
-        per_table[orig] = diff
-        if diff["verdict"] == "REAL_DIFFERENCE":
-            all_eq = False
-        console.print(
-            f"    verdict: {diff['verdict']} | "
-            f"identical {diff['buckets']['identical']:,} | "
-            f"extras {diff['buckets']['extra_in_b']:,} | "
-            f"missing {diff['buckets']['missing_from_b']:,} | "
-            f"drifted {diff['buckets']['same_key_drifted_metric']:,}"
-        )
+    # 2b + 3. Tier 1 via the shared equivalence+nondeterminism helper.
+    eq = _equivalence_and_nd(
+        write_orig=write_orig,
+        write_sb=write_sb,
+        prod_boundary_versions=clone_meta.get("prod_boundary_versions") or {},
+        explicit_ignore=list(clone_meta.get("equivalence_ignore_columns") or []),
+        proposal_dir=proposal_dir,
+        console=console,
+        optimized_succeeded=True,
+    )
+    summary["nondeterminism"] = eq["nondeterminism"]
+    per_table = eq["per_table"]
+    all_eq = eq["all_eq"]
 
     # 4. Tier 3 perf
     runtime_pct = 0.0
@@ -1762,6 +1857,8 @@ def _render_finalize_md(
                 for e in entries[:8]:
                     drift_section += f"- `{e['dim_value']}`: {e['rows']:,} rows\n"
 
+    nd_section = _render_nd_section(summary)
+
     return f"""# Proposal: optimize `{summary['task_key']}` in job {summary['prod_job_id']}
 
 **Status**: {verdict}
@@ -1787,6 +1884,7 @@ def _render_finalize_md(
 (Verdict types: **IDENTICAL** = byte-identical, **FLOAT_REORDER_ONLY** = only machine-epsilon
 drift on DOUBLE columns, **REAL_DIFFERENCE** = real semantic divergence — agent's algebra is off.)
 {drift_section}
+{nd_section}
 ## Agent's notebook changes
 
 {diff_section}

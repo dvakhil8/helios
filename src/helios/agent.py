@@ -341,9 +341,16 @@ def run_turn(
             ]
         messages.append(assistant_entry)
 
+        # Surface the model's reasoning text on EVERY turn that has any —
+        # not just the final no-tool-calls turn. The text immediately before
+        # tool calls is the model's "thinking aloud" (why it's about to call
+        # this tool); losing it leaves traces with tool I/O only and no
+        # rationale. Callers that previously assumed `on_text` = final-only
+        # still get the final call as their last invocation.
+        if msg.content and on_text:
+            on_text(msg.content)
+
         if not msg.tool_calls:
-            if msg.content and on_text:
-                on_text(msg.content)
             _persist_messages()
             return messages
 

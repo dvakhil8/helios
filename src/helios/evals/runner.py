@@ -256,6 +256,13 @@ def run_agent(
         ctx, trace, violations, frozen_job_ids=frozen_job_ids, live_log=live_log,
     )
 
+    def on_text(text: str) -> None:
+        # Stream the model's reasoning into trace.jsonl so the live tail shows
+        # the "why" alongside the tool I/O. Cap per-event size — long
+        # reasoning bursts shouldn't bloat the log line indefinitely.
+        snippet = text if len(text) <= 4000 else text[:4000] + "...[truncated]"
+        _live_write(live_log, "assistant_text", text=snippet)
+
     def on_tool_call(name: str, args: dict[str, Any]) -> None:
         trace.append(TraceEntry(
             timestamp=time.time(), tool=name, args=args, result_preview=""
@@ -315,6 +322,7 @@ def run_agent(
             yolo=True,
             max_iters=max_iters,
             console=console,
+            on_text=on_text,
             on_tool_call=on_tool_call,
             on_tool_result=on_tool_result,
             message_log_path=message_log_path,

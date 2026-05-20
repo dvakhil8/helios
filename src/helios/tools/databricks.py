@@ -787,6 +787,19 @@ def _explain_one_mode(
             f"{join_counts['CartesianProduct']} CartesianProduct — these explode "
             "rows by N×M. Almost always wrong unless intentional."
         )
+    if "BroadcastNestedLoopJoin" in join_counts:
+        # BNLJ ≈ "join condition has no equality key, only inequality / interval
+        # predicate" (BETWEEN, <, >, overlap). Without a hint Spark falls back
+        # to O(n·m). Databricks Photon often emits exactly this hint
+        # suggestion in run insights — mirror it here.
+        warnings.append(
+            f"{join_counts['BroadcastNestedLoopJoin']} BroadcastNestedLoopJoin "
+            "— this is a non-equi (range/interval) join. Add a "
+            "/*+ RANGE_JOIN(rel, bin_size) */ hint with bin_size ≈ the typical "
+            "interval length in the range column's units (e.g. 3600 for "
+            "seconds with ~1h intervals). Same results, ~linear instead of "
+            "O(n·m)."
+        )
     if len(exchanges) >= 5:
         warnings.append(
             f"{len(exchanges)} Exchange (shuffle) operators — heavy shuffling. "
