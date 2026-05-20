@@ -828,6 +828,34 @@ def _explain_one_mode(
     }
 
 
+# Module-level run-stamp heuristic (used by diff_tables AND by propose.py's
+# self-authorizing safety gate — both need the same definition of "this
+# column is a write-time stamp, never part of the data's identity").
+_RUN_STAMP_NAMES: frozenset[str] = frozenset({
+    "last_refresh_time", "last_refresh_date", "refresh_time", "refresh_timestamp",
+    "last_updated", "last_updated_at", "updated_at", "updated_time", "update_timestamp",
+    "loaded_at", "load_timestamp", "load_time", "etl_timestamp", "etl_time",
+    "etl_loaded_at", "ingested_at", "ingestion_time", "ingestion_timestamp",
+    "inserted_at", "insert_timestamp", "processed_at", "process_timestamp",
+    "run_timestamp", "run_time", "_run_id", "batch_id", "batch_timestamp",
+    "dbt_updated_at", "dbt_loaded_at", "_loaded_at", "record_loaded_time",
+    "created_at", "create_time", "created_timestamp",
+})
+_RUN_STAMP_SUFFIXES: tuple[str, ...] = (
+    "_refresh_time", "_refresh_date", "_loaded_at",
+    "_etl_timestamp", "_run_timestamp", "_ingested_at",
+)
+
+
+def looks_run_stamp(name: str) -> bool:
+    """True iff `name` matches a known ETL run-stamp pattern. Type-agnostic;
+    callers gate further on TIMESTAMP/DATE typing if they need to be strict."""
+    ln = name.lower().strip("`")
+    if ln in _RUN_STAMP_NAMES:
+        return True
+    return ln.endswith(_RUN_STAMP_SUFFIXES)
+
+
 DIFF_TABLES_SCHEMA: dict[str, Any] = {
     "name": "diff_tables",
     "description": (
@@ -992,23 +1020,7 @@ def diff_tables(
     # data's identity and aren't meaningful to compare. Matched conservatively:
     # only well-known refresh/load/etl stamp names, not generic *_date / *_time
     # (those are usually business dates that SHOULD be in the key).
-    _run_stamp_names = {
-        "last_refresh_time", "last_refresh_date", "refresh_time", "refresh_timestamp",
-        "last_updated", "last_updated_at", "updated_at", "updated_time", "update_timestamp",
-        "loaded_at", "load_timestamp", "load_time", "etl_timestamp", "etl_time",
-        "etl_loaded_at", "ingested_at", "ingestion_time", "ingestion_timestamp",
-        "inserted_at", "insert_timestamp", "processed_at", "process_timestamp",
-        "run_timestamp", "run_time", "_run_id", "batch_id", "batch_timestamp",
-        "dbt_updated_at", "dbt_loaded_at", "_loaded_at", "record_loaded_time",
-        "created_at", "create_time", "created_timestamp",
-    }
-    def looks_run_stamp(name: str) -> bool:
-        ln = name.lower().strip("`")
-        if ln in _run_stamp_names:
-            return True
-        # suffix patterns
-        return ln.endswith(("_refresh_time", "_refresh_date", "_loaded_at",
-                            "_etl_timestamp", "_run_timestamp", "_ingested_at"))
+    # _RUN_STAMP_NAMES / looks_run_stamp are at module scope (below).
 
     ignored = set(ignore_columns or [])
     auto_ignored: list[str] = []

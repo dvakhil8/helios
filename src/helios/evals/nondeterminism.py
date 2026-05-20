@@ -83,15 +83,46 @@ NONDETERMINISM CATALOG (assign the single best class)
 
 LINEAGE & PROPAGATION (critical — do not pattern-match blindly)
   Trace each FINAL output column to its source expression. A nondeterministic
-  construct only taints columns it actually flows into:
-    - max(x)/min(x) over tied rows           -> DETERMINISTIC (value is stable)
-    - a non-key attribute carried from the
-      row picked by an untied ROW_NUMBER     -> NONDETERMINISTIC (class B)
+  construct only taints columns it actually flows into. For a `ROW_NUMBER()
+  OVER (PARTITION BY ... ORDER BY ...)` with potential ties, exactly THREE
+  kinds of columns flow out:
+
+    1. PARTITION KEY columns of the ROW_NUMBER → DETERMINISTIC.
+       Reason: every tied row shares the SAME partition-key values by
+       definition (they were grouped together). Projecting the partition
+       key yields the same value regardless of which tied row is picked.
+
+    2. ORDER BY KEY columns (the ranking expression itself) → DETERMINISTIC
+       on the picked row. Reason: "tied on x" means all tied rows have the
+       same x value, so projecting x is invariant under the arbitrary pick.
+
+    3. ALL OTHER ATTRIBUTES carried from the picked row → NONDETERMINISTIC
+       (this is the only class B case). These are the carried-along columns
+       like a label, description, foreign-key id, etc. that differ across
+       the tied rows.
+
+  Worked examples:
+    - max(x)/min(x) over tied rows            -> DETERMINISTIC
     - SUM over ALL tied rows                  -> DETERMINISTIC (order-free)
-    - the ORDER BY key itself                 -> DETERMINISTIC
-  For a class B argmax, also identify the sibling DETERMINISTIC column that is
-  the ranking value (e.g. the max the pick was based on) in
-  `deterministic_sibling` — it is the corroborating evidence.
+    - in `ROW_NUMBER() OVER (PARTITION BY uid, show_id ORDER BY ts)`:
+        uid, show_id (partition keys)          -> DETERMINISTIC
+        ts (ORDER BY key)                      -> DETERMINISTIC on ties
+        plan_id (carried attribute)            -> NONDETERMINISTIC (class B)
+
+  DO NOT classify partition-key columns or the ORDER BY key column itself
+  as B_untied_pick. They are NOT carried-along attributes; they are the
+  ROW_NUMBER's own structural inputs and are invariant under tied picks.
+
+  REQUIRED for every B_untied_pick column:
+    - Populate `deterministic_sibling` with the name of the ORDER BY KEY
+      column (e.g. "create_time" / "ts" / "playtime"). This is what an
+      empirical tie-break check joins on to corroborate your hypothesis.
+    - Only set `deterministic_sibling` to null when the ORDER BY clause is
+      a complex expression that doesn't correspond to a single output column
+      (e.g. ORDER BY CASE WHEN x IS NULL THEN 1 ELSE 0 END, y — the sibling
+      is `y`, not the CASE expression). In that case, identify the dominant
+      ranking column.
+    - A column may NEVER be its own deterministic_sibling.
 
 OUTPUT — STRICT JSON ONLY, no prose, no markdown fences. Schema:
 {

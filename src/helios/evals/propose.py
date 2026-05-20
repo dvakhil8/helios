@@ -77,6 +77,18 @@ class TaskCloneResult:
     # Prod boundary itself is pinned via VERSION AS OF (we know the exact
     # version at clone time) when diff_tables compares for equivalence.
     prod_boundary_versions: dict[str, int] = field(default_factory=dict)
+    # Per-write-target mode: "full_rewrite" (CTAS / CREATE OR REPLACE / INSERT
+    # OVERWRITE) vs "incremental" (INSERT INTO / MERGE INTO appending to an
+    # accumulating table). Drives whether diff_tables compares the full prod
+    # table or just the prod increment for this task's commit.
+    write_target_modes: dict[str, str] = field(default_factory=dict)
+    # For incremental targets only: the prod table's Delta version JUST BEFORE
+    # the prod task's WRITE/MERGE commit. The increment = post EXCEPT pre.
+    prod_pre_versions: dict[str, int] = field(default_factory=dict)
+    # Partition columns of each write target (from DESCRIBE DETAIL). Used to
+    # bound the prod-increment EXCEPT to just the affected partitions —
+    # critical for avoiding archived-partition access and full-table scans.
+    partition_columns_by_target: dict[str, list[str]] = field(default_factory=dict)
     unpinnable_sources: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -360,6 +372,51 @@ def rewrite_write_targets(
 # =============================================================================
 
 
+def detect_incremental(notebook_sql: str, write_target_fqn: str) -> str:
+    """Classify a write target's write mode by scanning the notebook SQL.
+
+    `full_rewrite`: CREATE OR REPLACE TABLE <t>, INSERT OVERWRITE <t>, CTAS.
+    `incremental`:  INSERT INTO <t> / MERGE INTO <t> with no enclosing full
+                    rewrite of the same target. Daily ETLs appending rows.
+
+    Returns `"full_rewrite"` or `"incremental"`. The default on ambiguity is
+    `full_rewrite` (safer — diff_tables will compare the full table; if the
+    sandbox is actually only an increment, the result will be a visibly
+    extreme mismatch the human notices, vs. a silently-wrong comparison).
+    """
+    if not notebook_sql:
+        return "full_rewrite"
+    # Plain table name (drop catalog/schema qualifier); SQL identifiers
+    # commonly refer to write targets either fully-qualified or by name.
+    bare = write_target_fqn.rsplit(".", 1)[-1].lower()
+    fq_l = write_target_fqn.lower()
+
+    def _refs_target(stmt_re: re.Pattern[str]) -> bool:
+        for m in stmt_re.finditer(notebook_sql):
+            tail = notebook_sql[m.end(): m.end() + 400].lower()
+            # First identifier-ish token after the verb
+            id_match = re.match(r"\s*([`a-zA-Z0-9_.]+)", tail)
+            if not id_match:
+                continue
+            ident = id_match.group(1).strip("`").lower()
+            if ident == fq_l or ident == bare or ident.endswith("." + bare):
+                return True
+        return False
+
+    full_re = re.compile(
+        r"(?:CREATE\s+(?:OR\s+REPLACE\s+)?TABLE|REPLACE\s+TABLE|"
+        r"INSERT\s+OVERWRITE(?:\s+TABLE)?)\s+",
+        re.IGNORECASE,
+    )
+    inc_re = re.compile(r"(?:INSERT\s+INTO|MERGE\s+INTO)\s+", re.IGNORECASE)
+
+    if _refs_target(full_re):
+        return "full_rewrite"
+    if _refs_target(inc_re):
+        return "incremental"
+    return "full_rewrite"
+
+
 def clone_task_from_prod(
     *,
     prod_job_id: int,
@@ -444,12 +501,80 @@ def clone_task_from_prod(
 
     # Capture the current version of each prod boundary write target — this is
     # the snapshot we'll compare the sandbox output against for equivalence.
+    # For INCREMENTAL targets (INSERT INTO / MERGE INTO), also capture:
+    #   * write_target_modes[fqn] — classify full_rewrite vs incremental.
+    #   * prod_pre_versions[fqn] — version JUST BEFORE the prod task's commit,
+    #       so the prod-side increment can be computed as (post EXCEPT pre).
+    #   * partition_columns_by_target[fqn] — used to bound the increment view
+    #       to the affected partitions (cheap, avoids archived-partition reads).
     prod_boundary_versions: dict[str, int] = {}
+    write_target_modes: dict[str, str] = {}
+    prod_pre_versions: dict[str, int] = {}
+    partition_columns_by_target: dict[str, list[str]] = {}
     for fqn in writes:
         try:
             r = execute_sql(f"DESCRIBE HISTORY {fqn} LIMIT 1", timeout_seconds=60)
             if r["rows"]:
                 prod_boundary_versions[fqn] = int(r["rows"][0]["version"])
+        except Exception:
+            pass
+        # Classify mode from the canonical notebook source.
+        mode = detect_incremental(source_text, fqn)
+        write_target_modes[fqn] = mode
+        if mode != "incremental":
+            continue
+        # Pre-version: lowest commit version in the prod task's time window
+        # whose operation modifies data → minus 1. Falls back to (post - 1)
+        # if we can't find a tight window. Bounded scan of the last ~50
+        # commits — enough for any daily ETL.
+        post = prod_boundary_versions.get(fqn)
+        if post is None:
+            continue
+        try:
+            hist = execute_sql(
+                f"SELECT version, timestamp, operation FROM (DESCRIBE HISTORY {fqn}) "
+                f"WHERE version BETWEEN {max(0, post - 50)} AND {post} "
+                f"AND operation IN ('WRITE','MERGE','UPDATE','DELETE','INSERT') "
+                f"ORDER BY version ASC",
+                timeout_seconds=60,
+            )["rows"]
+            in_window: list[int] = []
+            # Define the prod task time window: [align_ts - 30min, now]. align_ts
+            # is the task START; commits typically land near task END. We accept
+            # any data-modifying commit in this generous window; the lowest is
+            # the start of the prod task's write sequence.
+            if align_ts and hist:
+                from datetime import datetime, timedelta
+                start = _parse_spark_ts(align_ts)
+                if start is not None:
+                    lo = start - timedelta(minutes=30)
+                    for h in hist:
+                        ts = h.get("timestamp")
+                        if isinstance(ts, str):
+                            ts_p = _parse_spark_ts(ts)
+                        elif hasattr(ts, "year"):
+                            ts_p = ts.replace(tzinfo=None) if getattr(ts, "tzinfo", None) else ts
+                        else:
+                            ts_p = None
+                        if ts_p is not None and ts_p >= lo:
+                            in_window.append(int(h["version"]))
+            min_v = min(in_window) if in_window else post
+            prod_pre_versions[fqn] = max(0, min_v - 1)
+        except Exception:
+            prod_pre_versions[fqn] = max(0, post - 1)
+        # Partition columns — drives bounded prod-increment view.
+        try:
+            det = execute_sql(f"DESCRIBE DETAIL {fqn}", timeout_seconds=60)["rows"]
+            if det:
+                pcols = det[0].get("partitionColumns")
+                if isinstance(pcols, str):
+                    # Some workspaces return JSON string; parse defensively.
+                    try:
+                        pcols = json.loads(pcols)
+                    except Exception:
+                        pcols = []
+                if pcols:
+                    partition_columns_by_target[fqn] = list(pcols)
         except Exception:
             pass
 
@@ -499,6 +624,9 @@ def clone_task_from_prod(
         source_alignment_basis=align_source,
         source_pinned_fqns=source_pinned_at,
         prod_boundary_versions=prod_boundary_versions,
+        write_target_modes=write_target_modes,
+        prod_pre_versions=prod_pre_versions,
+        partition_columns_by_target=partition_columns_by_target,
         unpinnable_sources=pin_warnings,
     )
     return sandbox_job_id, clone
@@ -719,6 +847,9 @@ def propose(
             "source_alignment_basis": clone.source_alignment_basis,
             "source_pinned_fqns": clone.source_pinned_fqns,
             "prod_boundary_versions": clone.prod_boundary_versions,
+            "write_target_modes": clone.write_target_modes,
+            "prod_pre_versions": clone.prod_pre_versions,
+            "partition_columns_by_target": clone.partition_columns_by_target,
             "unpinnable_sources": clone.unpinnable_sources,
             "run_catalog": ctx.run_catalog,
             "run_schema": ctx.run_schema,
@@ -903,6 +1034,14 @@ HARD CONSTRAINTS (do not violate these):
     `VERSION AS OF` (the exact command is given verbatim in step 5 below).
     Never diff against the live/unpinned prod table and never invent a
     `*__boundary` / snapshot table — no such table exists.
+  - **Preserve the write mode.** If the original notebook uses `INSERT INTO`
+    or `MERGE INTO`, the task is INCREMENTAL — it appends/updates rows on
+    top of prod's accumulated history. DO NOT rewrite `INSERT INTO` into
+    `CREATE OR REPLACE TABLE AS SELECT` (or `INSERT OVERWRITE`); that would
+    REPLACE prod's entire historical table with just today's rows when the
+    PR ships. The harness scoring already compares against the prod-side
+    INCREMENT for these tasks — your sandbox output IS the day's increment
+    by design, not a full table. Keep `INSERT INTO`/`MERGE INTO` as-is.
   - Write targets {write_targets_original} are re-mapped to {write_targets_sandbox}
     in the sandbox notebook. Output must produce equivalent content to the
     cached prod snapshot. DO NOT change the SELECT columns / aggregations /
@@ -1139,6 +1278,259 @@ def _aggregate_verdict(verdicts: list[str]) -> str:
     return "IDENTICAL"
 
 
+def _build_prod_increment_view(
+    *,
+    orig_fqn: str,
+    post_v: int,
+    pre_v: int | None,
+    partition_cols: list[str],
+    sandbox_fqn: str,
+    sandbox_schema: str,
+    console: Console,
+) -> tuple[str, dict[str, Any]]:
+    """Materialize a view in the sandbox schema that exposes ONLY the prod-side
+    increment for an incremental write target (INSERT INTO / MERGE INTO).
+
+    Algorithm (from cheap to expensive):
+      * Partitioned + sandbox covers a subset of partition values
+          → bound `prod VERSION AS OF post` by those partition predicates.
+          If pre had 0 rows in that range → no EXCEPT needed (pure new-partition INSERT).
+          Otherwise → bounded EXCEPT.
+      * Non-partitioned → unbounded EXCEPT on full table versions (slow; fallback).
+
+    Returns (view_fqn, metadata) where metadata describes which path was taken.
+    """
+    from ..tools.databricks import execute_sql
+
+    bare = orig_fqn.rsplit(".", 1)[-1].replace("`", "")
+    view_name = f"prod_increment__{bare}"
+    view_fqn = f"{sandbox_schema}.{view_name}"
+    meta: dict[str, Any] = {
+        "post_version": post_v, "pre_version": pre_v,
+        "partition_cols": partition_cols, "where_clause": None, "used_except": False,
+    }
+
+    # Discover the sandbox-side range for each partition column (the set of
+    # partition values the sandbox actually wrote to — defines the scope).
+    where_clauses: list[str] = []
+    if partition_cols:
+        for pc in partition_cols:
+            r = execute_sql(
+                f"SELECT MIN(`{pc}`) AS lo, MAX(`{pc}`) AS hi, "
+                f"COUNT(DISTINCT `{pc}`) AS n FROM {sandbox_fqn}",
+                timeout_seconds=120,
+            )["rows"][0]
+            lo, hi, n = r.get("lo"), r.get("hi"), int(r.get("n") or 0)
+            if lo is None or hi is None or n == 0:
+                continue
+            # Quote string-y values; cast through string for safety on dates.
+            if str(lo) == str(hi):
+                where_clauses.append(f"`{pc}` = '{lo}'")
+            else:
+                where_clauses.append(f"`{pc}` BETWEEN '{lo}' AND '{hi}'")
+
+    if where_clauses:
+        where = " AND ".join(where_clauses)
+        meta["where_clause"] = where
+        # If pre had 0 rows in this scope, the entire scope IS the new
+        # increment — no EXCEPT needed (typical daily new-partition INSERT).
+        pre_count = 0
+        if pre_v is not None:
+            try:
+                pre_count = int(execute_sql(
+                    f"SELECT COUNT(*) AS c FROM {orig_fqn} VERSION AS OF {pre_v} "
+                    f"WHERE {where}",
+                    timeout_seconds=180,
+                )["rows"][0]["c"])
+            except Exception:
+                pre_count = 1  # be safe: assume pre had rows → use EXCEPT
+        if pre_count == 0:
+            view_sql = (
+                f"SELECT * FROM {orig_fqn} VERSION AS OF {post_v} WHERE {where}"
+            )
+        else:
+            meta["used_except"] = True
+            view_sql = (
+                f"SELECT * FROM {orig_fqn} VERSION AS OF {post_v} WHERE {where} "
+                f"EXCEPT "
+                f"SELECT * FROM {orig_fqn} VERSION AS OF {pre_v} WHERE {where}"
+            )
+    else:
+        # Non-partitioned: unbounded EXCEPT. Slow on large tables but correct.
+        meta["used_except"] = True
+        pre_ref = pre_v if pre_v is not None else max(0, post_v - 1)
+        view_sql = (
+            f"SELECT * FROM {orig_fqn} VERSION AS OF {post_v} "
+            f"EXCEPT "
+            f"SELECT * FROM {orig_fqn} VERSION AS OF {pre_ref}"
+        )
+
+    execute_sql(
+        f"CREATE OR REPLACE VIEW {view_fqn} AS {view_sql}",
+        timeout_seconds=300,
+    )
+    console.print(
+        f"    [dim]prod-increment view materialized: {view_fqn} "
+        f"(post=v{post_v}, pre={'v'+str(pre_v) if pre_v is not None else '∅'}, "
+        f"where={meta['where_clause'] or 'all rows'}, "
+        f"EXCEPT={meta['used_except']})[/]"
+    )
+    return view_fqn, meta
+
+
+def _value_preservation_check(
+    *,
+    table_a: str,
+    table_b: str,
+    natural_key: list[str],
+    probe_required: list[str],
+    columns_detail: dict[str, dict[str, Any]],
+    console: Console,
+) -> list[dict[str, Any]]:
+    """Empirical tie-break corroboration. For each probe-required column with
+    a declared `deterministic_sibling` (the ORDER BY key of the untied
+    ROW_NUMBER), join prod-side vs sandbox-side on the stable natural key and
+    classify the discrepancy:
+
+      diff_total == 0          → DETERMINISTIC_EMPIRICALLY (never differed)
+      diff>0  &  sibling_diff==0 → TIE_BREAK_CONFIRMED (safe to exclude)
+      diff>0  &  sibling_diff>0  → POSSIBLE_REAL_BUG (do not exclude)
+
+    Converts the manual "is this a real bug or just a tied argmax?" diagnostic
+    into a permanent, automated part of every proposal.
+    """
+    from ..tools.databricks import execute_sql
+
+    if not probe_required:
+        return []
+    # Build per-column entries. Columns WITH a declared sibling get the full
+    # tie-break vs real-bug discriminator (diff_total + sibling_SAME +
+    # sibling_DIFF). Columns WITHOUT a sibling still get diff_total — the
+    # LLM may have skipped the sibling field (stochastic), but diff=0 alone
+    # is enough to mark the column DETERMINISTIC_EMPIRICALLY; diff>0 without
+    # a sibling is surfaced as DIFFERS_NO_SIBLING_TO_CHECK so the human knows
+    # the LLM left an evidence gap.
+    entries: list[dict[str, Any]] = []
+    siblings: set[str] = set()
+    for c in probe_required:
+        sib = (columns_detail.get(c, {}) or {}).get("deterministic_sibling")
+        # Forbid self-reference (a column can't be its own ORDER BY key).
+        if sib == c:
+            sib = None
+        entries.append({"column": c, "sibling": sib})
+        if sib:
+            siblings.add(sib)
+    # Build a JOIN key that EXCLUDES both probe cols and their siblings (we
+    # measure their differences/matches; they can't also be join keys).
+    excluded = set(probe_required) | siblings
+    join_keys = [k for k in natural_key if k not in excluded]
+    if not join_keys:
+        console.print(
+            "[yellow]value-preservation skipped: no usable join key left "
+            "after excluding probe columns and their siblings[/]"
+        )
+        return []
+    join_cond = " AND ".join(f"p.`{k}` <=> s.`{k}`" for k in join_keys)
+
+    # One aggregated query covering every column. With-sibling columns get
+    # 3 measurements; without-sibling get 1.
+    def _alias(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_]", "_", s)
+    select_parts: list[str] = ["COUNT(*) AS paired_rows"]
+    for e in entries:
+        c = e["column"]; sib = e["sibling"]
+        ca = _alias(c)
+        select_parts.append(
+            f"SUM(CASE WHEN NOT (p.`{c}` <=> s.`{c}`) THEN 1 ELSE 0 END) "
+            f"AS `{ca}__diff_total`"
+        )
+        if sib:
+            select_parts.extend([
+                f"SUM(CASE WHEN NOT (p.`{c}` <=> s.`{c}`) "
+                f"AND (p.`{sib}` <=> s.`{sib}`) THEN 1 ELSE 0 END) "
+                f"AS `{ca}__sibling_SAME`",
+                f"SUM(CASE WHEN NOT (p.`{c}` <=> s.`{c}`) "
+                f"AND NOT (p.`{sib}` <=> s.`{sib}`) THEN 1 ELSE 0 END) "
+                f"AS `{ca}__sibling_DIFF`",
+            ])
+    sql = (
+        f"SELECT {', '.join(select_parts)} "
+        f"FROM (SELECT * FROM {table_a}) p "
+        f"JOIN (SELECT * FROM {table_b}) s ON {join_cond}"
+    )
+    with_sib = sum(1 for e in entries if e["sibling"])
+    console.print(
+        f"[cyan]→ value-preservation check on {len(entries)} probe-required "
+        f"column(s) ({with_sib} with sibling, {len(entries)-with_sib} "
+        f"diff-only); join key={join_keys}[/]"
+    )
+    try:
+        row = execute_sql(sql, timeout_seconds=1800)["rows"][0]
+    except Exception as ex:
+        console.print(
+            f"[yellow]value-preservation check failed: "
+            f"{type(ex).__name__}: {ex}[/]"
+        )
+        return []
+
+    paired = int(row.get("paired_rows") or 0)
+    results: list[dict[str, Any]] = []
+    for e in entries:
+        c = e["column"]; sib = e["sibling"]
+        ca = _alias(c)
+        total = int(row.get(f"{ca}__diff_total") or 0)
+        same = int(row.get(f"{ca}__sibling_SAME") or 0) if sib else 0
+        diff = int(row.get(f"{ca}__sibling_DIFF") or 0) if sib else 0
+
+        if total == 0:
+            verdict = "DETERMINISTIC_EMPIRICALLY"
+            note = (
+                "Column matched on every paired row — LLM was overcautious. "
+                "Safe to drop from `equivalence_ignore_columns` (no effect "
+                "either way; just less noise)."
+            )
+        elif sib is None:
+            verdict = "DIFFERS_NO_SIBLING_TO_CHECK"
+            note = (
+                f"Column differs on {total:,} rows, but the LLM did not "
+                "identify a deterministic ORDER BY sibling — can't auto-"
+                "discriminate tie-break vs real-bug. Inspect manually, or "
+                "set the sibling explicitly in `clone.json` and re-finalize."
+            )
+        elif diff == 0:
+            verdict = "TIE_BREAK_CONFIRMED"
+            note = (
+                f"All {total:,} differences occur on rows where the ORDER BY "
+                f"sibling `{sib}` matches between prod and sandbox → arbitrary "
+                "pick among rows tied on the ranking key. Safe to add to "
+                "`equivalence_ignore_columns` with rationale."
+            )
+        else:
+            verdict = "POSSIBLE_REAL_BUG"
+            note = (
+                f"{diff:,} of {total:,} differences have a DIFFERING sibling "
+                f"`{sib}` — at least some picks landed on rows with truly "
+                "different ordering values. NOT a pure tie-break; do NOT "
+                "exclude without investigating the algebra."
+            )
+        results.append({
+            "column": c, "sibling": sib,
+            "paired_rows": paired,
+            "diff_total": total,
+            "sibling_SAME": same,
+            "sibling_DIFF": diff,
+            "verdict": verdict, "note": note,
+        })
+        console.print(
+            f"    [dim]{c}"
+            + (f" (sibling {sib})" if sib else " (no sibling)")
+            + f": {verdict} (diff={total}"
+            + (f", sibling_same={same}, sibling_diff={diff}" if sib else "")
+            + ")[/]"
+        )
+    return results
+
+
 def _equivalence_and_nd(
     *,
     write_orig: list[str],
@@ -1148,27 +1540,38 @@ def _equivalence_and_nd(
     proposal_dir: Path,
     console: Console,
     optimized_succeeded: bool = True,
+    write_target_modes: dict[str, str] | None = None,
+    prod_pre_versions: dict[str, int] | None = None,
+    partition_columns_by_target: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Single source of truth for Tier-1 equivalence across propose /
     propose-resume / propose-finalize.
 
     1. LLM nondeterminism analysis on the ORIGINAL canonical notebook.
-    2. Effective ignore = human-confirmed explicit list ∪ LLM
-       self-authorizing/already-handled. probe_required is NEVER
-       auto-excluded (data-derived, indistinguishable from a real bug) —
-       only surfaced for the determinism probe / human sign-off.
-    3. diff_tables per boundary table, prod side pinned to its captured
-       Delta version.
+    2. Effective ignore = explicit ∪ LLM self-authorizing (gated to the
+       known-safe run-stamp class). probe_required is NEVER auto-excluded
+       (data-derived; indistinguishable from a real bug) — only surfaced
+       for the determinism probe / human sign-off.
+    3. For each boundary table:
+         * full_rewrite mode → diff against the pinned prod table directly.
+         * incremental mode → materialize a prod-increment view (post EXCEPT
+           pre, partition-bounded) and diff against that.
 
     Returns {per_table, all_eq, nondeterminism}.
     """
-    from ..tools.databricks import diff_tables, execute_sql
+    from ..tools.databricks import diff_tables, execute_sql, looks_run_stamp
+
+    write_target_modes = write_target_modes or {}
+    prod_pre_versions = prod_pre_versions or {}
+    partition_columns_by_target = partition_columns_by_target or {}
 
     if not optimized_succeeded:
         return {"per_table": {}, "all_eq": False, "nondeterminism": {}}
 
-    # 1. Nondeterminism analysis (graceful: never breaks scoring).
+    # 1. Nondeterminism analysis. We also capture each column's type from the
+    # DESCRIBE so the self_authorizing safety gate can check TIMESTAMP/DATE.
     nd_analysis: dict[str, Any] = {}
+    col_types_by_orig: dict[str, dict[str, str]] = {}
     orig_sql_path = proposal_dir / "notebook_original.txt"
     if orig_sql_path.exists():
         try:
@@ -1184,11 +1587,14 @@ def _equivalence_and_nd(
                     timeout_seconds=120,
                 )["rows"]
                 ocols: list[str] = []
+                ctypes: dict[str, str] = {}
                 for r in drows:
                     n = (r.get("col_name") or "").strip()
                     if not n or n.startswith("#"):
                         break
                     ocols.append(n)
+                    ctypes[n] = (r.get("data_type") or "").upper()
+                col_types_by_orig[orig] = ctypes
                 console.print(
                     f"[cyan]→ analyzing nondeterminism on {len(ocols)} "
                     f"output columns of {orig}[/]"
@@ -1208,25 +1614,77 @@ def _equivalence_and_nd(
             "analysis[/]"
         )
 
+    # Sandbox schema for materializing prod-increment views (derived from the
+    # first sandbox FQN: <catalog>.<schema>.<table>).
+    sandbox_schema = ".".join(write_sb[0].split(".")[:2]) if write_sb else ""
+
     # 2 + 3. Effective ignore + diff_tables per boundary table.
     per_table: dict[str, Any] = {}
     all_eq = True
     for orig, sb in zip(write_orig, write_sb):
-        pinned_orig = (
-            f"{orig} VERSION AS OF {prod_boundary_versions[orig]}"
-            if orig in prod_boundary_versions
-            else orig
-        )
-        pinned_label = pinned_orig if pinned_orig != orig else orig
+        mode = write_target_modes.get(orig, "full_rewrite")
+        post_v = prod_boundary_versions.get(orig)
+        pre_v = prod_pre_versions.get(orig)
+        partition_cols = partition_columns_by_target.get(orig) or []
+
+        # Choose the prod-side reference: incremental view if applicable,
+        # else the pinned full table.
+        increment_meta: dict[str, Any] = {}
+        if mode == "incremental" and post_v is not None and sandbox_schema:
+            try:
+                view_fqn, increment_meta = _build_prod_increment_view(
+                    orig_fqn=orig, post_v=post_v, pre_v=pre_v,
+                    partition_cols=partition_cols, sandbox_fqn=sb,
+                    sandbox_schema=sandbox_schema, console=console,
+                )
+                pinned_orig = view_fqn
+                pinned_label = (
+                    f"{view_fqn}  [incremental: v{post_v}"
+                    f"{' EXCEPT v'+str(pre_v) if increment_meta.get('used_except') else ''}"
+                    f"{' WHERE '+increment_meta['where_clause'] if increment_meta.get('where_clause') else ''}]"
+                )
+            except Exception as e:
+                console.print(
+                    f"[yellow]prod-increment view build failed "
+                    f"({type(e).__name__}: {e}); falling back to full-table compare[/]"
+                )
+                pinned_orig = (
+                    f"{orig} VERSION AS OF {post_v}" if post_v is not None else orig
+                )
+                pinned_label = pinned_orig
+                mode = "full_rewrite_fallback"
+        else:
+            pinned_orig = (
+                f"{orig} VERSION AS OF {post_v}" if post_v is not None else orig
+            )
+            pinned_label = pinned_orig
+
+        # Safety gate on LLM self_authorizing: only auto-exclude columns that
+        # ALSO match the existing run-stamp name + TIMESTAMP/DATE type heuristic.
+        # Prevents an over-classified A_by_definition (e.g., "filtered by
+        # current_date") from silently widening the ignore set onto natural-key
+        # dimension columns and collapsing the join.
         nd = nd_analysis.get(orig, {})
-        auto_safe = list(nd.get("self_authorizing_columns") or []) + list(
-            nd.get("already_handled_columns") or []
-        )
-        effective_ignore = sorted(set(explicit_ignore) | set(auto_safe))
-        probe_required = list(nd.get("probe_required_columns") or [])
-        if auto_safe:
+        ctypes = col_types_by_orig.get(orig, {})
+        llm_safe = nd.get("self_authorizing_columns") or []
+        gated_safe: list[str] = []
+        gated_rejected: list[str] = []
+        for c in llm_safe:
+            ct = ctypes.get(c, "")
+            if looks_run_stamp(c) and any(s in ct for s in ("TIMESTAMP", "DATE")):
+                gated_safe.append(c)
+            else:
+                gated_rejected.append(c)
+        if gated_rejected:
             console.print(
-                f"    [dim]auto-ignored (self-authorizing): {auto_safe}[/]"
+                f"    [dim]LLM self_authorizing not auto-excluded (failed "
+                f"name+type gate, informational only): {gated_rejected}[/]"
+            )
+        effective_ignore = sorted(set(explicit_ignore) | set(gated_safe))
+        probe_required = list(nd.get("probe_required_columns") or [])
+        if gated_safe:
+            console.print(
+                f"    [dim]auto-ignored (self-authorizing, gated): {gated_safe}[/]"
             )
         if probe_required:
             console.print(
@@ -1241,6 +1699,24 @@ def _equivalence_and_nd(
         )
         diff["effective_ignore_columns"] = effective_ignore
         diff["nondeterminism_probe_required"] = probe_required
+        diff["mode"] = mode
+        if increment_meta:
+            diff["increment"] = increment_meta
+        diff["self_authorizing_rejected"] = gated_rejected
+        # Empirical tie-break corroboration: for every probe-required column
+        # with a declared deterministic sibling, check whether the
+        # ORDER BY key actually matches on the diverging rows. Runs against
+        # the underlying tables regardless of whether the columns are
+        # currently excluded — answers "would excluding this be safe?"
+        # independent of whether you already did.
+        if probe_required:
+            diff["tie_break_corroboration"] = _value_preservation_check(
+                table_a=pinned_orig, table_b=sb,
+                natural_key=diff.get("natural_key") or [],
+                probe_required=probe_required,
+                columns_detail=(nd.get("columns") or {}),
+                console=console,
+            )
         per_table[orig] = diff
         if diff["verdict"] == "REAL_DIFFERENCE":
             all_eq = False
@@ -1297,6 +1773,9 @@ def _score_proposal(
         proposal_dir=proposal_dir,
         console=console,
         optimized_succeeded=optimized_succeeded,
+        write_target_modes=clone.write_target_modes or {},
+        prod_pre_versions=clone.prod_pre_versions or {},
+        partition_columns_by_target=clone.partition_columns_by_target or {},
     )
     tier1 = _tier1_from_equivalence(eq)
     tier1["output_equivalence"] = tier1["equivalence_verdict"] in (
@@ -1367,12 +1846,54 @@ def _render_nd_section(summary: dict[str, Any]) -> str:
                 f"\n> ⚠️ **{len(probe)} column(s) flagged probe-required** "
                 f"({', '.join(f'`{c}`' for c in probe)}): data-derived "
                 "nondeterminism (e.g. untied argmax). NOT auto-excluded — "
-                "structurally indistinguishable from a real bug. If Tier 1 "
-                "is REAL_DIFFERENCE *solely* due to these, confirm via the "
-                "determinism probe (run the original notebook on the same "
-                "pinned inputs) before adding them to "
-                "`equivalence_ignore_columns` in `clone.json`.\n"
+                "structurally indistinguishable from a real bug. The tie-break "
+                "corroboration table below shows the empirical evidence.\n"
             )
+        # Empirical tie-break corroboration (value-preservation check).
+        tbc = (full_detail.get(orig, {}) or {}).get("tie_break_corroboration") or []
+        if tbc:
+            out += (
+                "\n### Tie-break corroboration (empirical)\n\n"
+                "For each probe-required column with a declared ORDER BY "
+                "sibling, we joined prod-side vs sandbox-side on the stable "
+                "natural key and inspected whether differing carried "
+                "attributes are accompanied by matching sibling values "
+                "(tie-break signature) or differing siblings (potential "
+                "real bug).\n\n"
+                "| Column | ORDER BY sibling | Rows where col differs | "
+                "Sibling matches | Sibling differs | Verdict |\n"
+                "|---|---|---|---|---|---|\n"
+            )
+            for t in tbc:
+                v = t["verdict"]
+                vmark = {
+                    "TIE_BREAK_CONFIRMED": "✅ TIE_BREAK_CONFIRMED",
+                    "DETERMINISTIC_EMPIRICALLY": "ℹ️ DETERMINISTIC_EMPIRICALLY",
+                    "POSSIBLE_REAL_BUG": "❌ POSSIBLE_REAL_BUG",
+                    "DIFFERS_NO_SIBLING_TO_CHECK": "⚠️ DIFFERS_NO_SIBLING_TO_CHECK",
+                }.get(v, v)
+                sib = t.get("sibling")
+                sib_cell = f"`{sib}`" if sib else "—"
+                sm = f"{t['sibling_SAME']:,}" if sib else "—"
+                sd = f"{t['sibling_DIFF']:,}" if sib else "—"
+                out += (
+                    f"| `{t['column']}` | {sib_cell} | "
+                    f"{t['diff_total']:,} | {sm} | {sd} | {vmark} |\n"
+                )
+            out += "\n"
+            for t in tbc:
+                out += f"- **`{t['column']}`**: {t['note']}\n"
+            out += "\n"
+            # Loud warning if any column flagged POSSIBLE_REAL_BUG.
+            if any(t["verdict"] == "POSSIBLE_REAL_BUG" for t in tbc):
+                bad = [t["column"] for t in tbc
+                       if t["verdict"] == "POSSIBLE_REAL_BUG"]
+                out += (
+                    f"\n> ❌ **WARNING**: {', '.join(f'`{c}`' for c in bad)} "
+                    "show differing ORDER BY siblings on some rows — this is "
+                    "NOT pure tie-break and may indicate the optimization "
+                    "broke the dedup algebra. Investigate before shipping.\n\n"
+                )
         out += "\n"
     return out
 
@@ -1619,6 +2140,9 @@ def resume(
             console=console,
             prod_boundary_versions=clone_meta.get("prod_boundary_versions") or {},
             explicit_ignore=list(clone_meta.get("equivalence_ignore_columns") or []),
+            write_target_modes=clone_meta.get("write_target_modes") or {},
+            prod_pre_versions=clone_meta.get("prod_pre_versions") or {},
+            partition_columns_by_target=clone_meta.get("partition_columns_by_target") or {},
         )
         summary["scores"] = {"tier1": _sc["tier1"], "tier3": _sc["tier3"]}
         summary["nondeterminism"] = _sc["nondeterminism"]
@@ -1644,6 +2168,9 @@ def _score_resume(
     console: Console,
     prod_boundary_versions: dict[str, int] | None = None,
     explicit_ignore: list[str] | None = None,
+    write_target_modes: dict[str, str] | None = None,
+    prod_pre_versions: dict[str, int] | None = None,
+    partition_columns_by_target: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     """Score a resume run via the shared equivalence+nondeterminism helper —
     identical Tier-1 semantics to propose / propose-finalize."""
@@ -1654,6 +2181,9 @@ def _score_resume(
         explicit_ignore=list(explicit_ignore or []),
         proposal_dir=proposal_dir,
         console=console,
+        write_target_modes=write_target_modes or {},
+        prod_pre_versions=prod_pre_versions or {},
+        partition_columns_by_target=partition_columns_by_target or {},
         optimized_succeeded=optimized_succeeded,
     )
     tier1 = _tier1_from_equivalence(eq)
@@ -1765,6 +2295,9 @@ def finalize(
         proposal_dir=proposal_dir,
         console=console,
         optimized_succeeded=True,
+        write_target_modes=clone_meta.get("write_target_modes") or {},
+        prod_pre_versions=clone_meta.get("prod_pre_versions") or {},
+        partition_columns_by_target=clone_meta.get("partition_columns_by_target") or {},
     )
     summary["nondeterminism"] = eq["nondeterminism"]
     per_table = eq["per_table"]
@@ -1821,15 +2354,37 @@ def _render_finalize_md(
     t3 = summary["scores"]["tier3"]
     verdict = "✅ PASS" if (t1["passed"] and t3["passed"]) else "⚠️ NEEDS REVIEW"
 
-    # Build per-table verdict table
+    # Build per-table verdict table (mode = full_rewrite or incremental)
+    full_detail = summary.get("tier1_full_detail") or {}
     per_table_md = []
+    increment_blocks: list[str] = []
     for orig, info in t1["per_table"].items():
         b = info["buckets"]
+        det = full_detail.get(orig, {}) or {}
+        mode = det.get("mode") or "full_rewrite"
         per_table_md.append(
-            f"| `{orig}` | {info['verdict']} | {b.get('identical', 0):,} | "
-            f"{b.get('extra_in_b', 0):,} | {b.get('missing_from_b', 0):,} | "
+            f"| `{orig}` | {mode} | {info['verdict']} | "
+            f"{b.get('identical', 0):,} | {b.get('extra_in_b', 0):,} | "
+            f"{b.get('missing_from_b', 0):,} | "
             f"{b.get('same_key_drifted_metric', 0):,} |"
         )
+        inc = det.get("increment")
+        if inc:
+            pre = inc.get('pre_version')
+            post = inc.get('post_version')
+            wh  = inc.get('where_clause')
+            ex  = inc.get('used_except')
+            increment_blocks.append(
+                f"- `{orig}`: compared **prod increment** (v{post}"
+                + (f" EXCEPT v{pre}" if ex else "")
+                + (f" WHERE `{wh}`" if wh else "")
+                + ") vs sandbox. Prod's accumulated history is NOT in scope; "
+                "only the rows this task's commit added/modified."
+            )
+    increment_section = (
+        "\n### Incremental scope (this task is `INSERT INTO` / `MERGE INTO`)\n\n"
+        + "\n".join(increment_blocks) + "\n"
+    ) if increment_blocks else ""
 
     # Notebook diff (sandbox-pre-agent vs whatever's at the workspace path now)
     diff_section = ""
@@ -1877,13 +2432,15 @@ def _render_finalize_md(
 
 ## Equivalence by boundary table
 
-| Boundary table | Verdict | Identical | Extra in sandbox | Missing | Drifted-metric |
-|---|---|---|---|---|---|
+| Boundary table | Mode | Verdict | Identical | Extra in sandbox | Missing | Drifted-metric |
+|---|---|---|---|---|---|---|
 {chr(10).join(per_table_md)}
 
 (Verdict types: **IDENTICAL** = byte-identical, **FLOAT_REORDER_ONLY** = only machine-epsilon
-drift on DOUBLE columns, **REAL_DIFFERENCE** = real semantic divergence — agent's algebra is off.)
-{drift_section}
+drift on DOUBLE columns, **REAL_DIFFERENCE** = real semantic divergence — agent's algebra is off.
+Modes: **full_rewrite** = compared against the full pinned prod table; **incremental** = compared
+against just the prod-side increment for this task's commit.)
+{increment_section}{drift_section}
 {nd_section}
 ## Agent's notebook changes
 
