@@ -279,6 +279,7 @@ def run_turn(
     tools_filter: Callable[[str], bool] | None = None,
     cancel_event: threading.Event | None = None,
     message_log_path: Any = None,
+    system_override: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run the agent until the model returns final text. Returns updated messages.
 
@@ -288,6 +289,11 @@ def run_turn(
     `tools_filter`, if given, is called with each tool name; only tools where it
     returns True are exposed to the model. Used by sub-agents to hide mutating
     tools when `allow_mutations` is False.
+
+    `system_override`, if given, replaces the default `build_system_message()`
+    content for messages[0]. Used by specialized sub-agents (e.g. the anomaly
+    evaluator) that need a completely different persona/system prompt — the
+    refresh-each-turn behavior still applies but uses this string verbatim.
     """
     if max_iters is None:
         max_iters = _default_max_iters()
@@ -301,7 +307,11 @@ def run_turn(
 
     # Refresh the system message so memories saved in earlier turns appear here.
     if messages and messages[0].get("role") == "system":
-        messages[0] = {"role": "system", "content": build_system_message()}
+        messages[0] = {
+            "role": "system",
+            "content": system_override if system_override is not None
+                       else build_system_message(),
+        }
 
     # Persist the messages array after each iteration so a Ctrl-C / crash
     # leaves enough state on disk for `propose-resume` to continue. Whole-file

@@ -997,12 +997,105 @@ def propose(
                 "tier3": {"tier": 3, "passed": False, "skipped": "agent_failed"},
             }
 
-        # 5. Render proposal.md and persist scores
+        # 4b. Independent anomaly evaluator agent (advisory, read-only).
+        # Runs ONCE PER WRITE TARGET; per-target verdicts + worst-of
+        # aggregate. Same wiring as finalize() — see that block for design
+        # rationale. Graceful skip on any failure; never gates PASS.
+        summary["evaluator"] = None
+        if optimized_succeeded:
+            try:
+                from .anomaly_evaluator import run_anomaly_evaluator
+                writes_orig = clone.write_targets_original or []
+                writes_sb = clone.write_targets_sandbox or []
+                per_table = (
+                    summary["scores"].get("tier1", {}).get("details", {})
+                    .get("per_table") or {}
+                )
+                if writes_orig and writes_sb:
+                    try:
+                        from ..tools.databricks import get_notebook_source
+                        optimized_sql = get_notebook_source(
+                            clone.sandbox_notebook_path
+                        )["content"]
+                    except Exception:
+                        optimized_sql = clone.sandbox_notebook_source
+
+                    per_target_results: dict[str, dict[str, Any]] = {}
+                    total = len(writes_orig)
+                    for idx, (orig, sb) in enumerate(zip(writes_orig, writes_sb), start=1):
+                        diff_for_eval = per_table.get(orig)
+                        if not diff_for_eval:
+                            continue
+                        prod_ver = (clone.prod_boundary_versions or {}).get(orig)
+                        prod_ref = (
+                            f"{orig} VERSION AS OF {prod_ver}"
+                            if prod_ver is not None else orig
+                        )
+                        mode = (clone.write_target_modes or {}).get(
+                            orig, "full_rewrite"
+                        )
+                        console.print(
+                            f"[cyan]→ evaluator: target {idx}/{total} ({orig})[/]"
+                        )
+                        safe = re.sub(r"[^A-Za-z0-9_]+", "__", orig)
+                        per_path = proposal_dir / (
+                            "evaluator.json" if total == 1
+                            else f"evaluator__{safe}.json"
+                        )
+                        ev_result = run_anomaly_evaluator(
+                            prod_fqn=prod_ref,
+                            sandbox_fqn=sb,
+                            original_sql=clone.original_notebook_source,
+                            optimized_sql=optimized_sql,
+                            diff_result=diff_for_eval,
+                            proposal_dir=proposal_dir,
+                            console=console,
+                            write_target_mode=mode,
+                            persist_path=per_path,
+                        )
+                        if ev_result is not None:
+                            per_target_results[orig] = ev_result
+
+                    if per_target_results:
+                        agg = _worst_evaluator_verdict(
+                            [r.get("verdict") for r in per_target_results.values()]
+                        )
+                        summary["evaluator"] = {
+                            "per_table": per_target_results,
+                            "aggregate_verdict": agg,
+                            "n_targets_evaluated": len(per_target_results),
+                            "n_targets_total": total,
+                        }
+                        if total > 1:
+                            try:
+                                (proposal_dir / "evaluator.json").write_text(
+                                    json.dumps(summary["evaluator"], indent=2, default=str)
+                                )
+                            except Exception:
+                                pass
+            except Exception as e:
+                console.print(
+                    f"[yellow]evaluator agent invocation failed: "
+                    f"{type(e).__name__}: {e}; proceeding without it[/]"
+                )
+
+        # 5. Render proposal.html (same renderer as finalize, for consistency).
+        # Re-read clone.json so we hand the renderer the same dict shape it
+        # expects from the finalize path — no special-casing.
         (proposal_dir / "proposal.json").write_text(json.dumps(summary, indent=2, default=str))
-        proposal_md = _render_proposal_md(summary=summary, clone=clone, history=history)
-        (proposal_dir / "proposal.md").write_text(proposal_md)
+        clone_meta = json.loads((proposal_dir / "clone.json").read_text())
+        proposal_html = _render_finalize_html(
+            summary=summary, clone_meta=clone_meta, proposal_dir=proposal_dir,
+        )
+        (proposal_dir / "proposal.html").write_text(proposal_html)
+        # Remove any stale .md from a prior run on the same run_id, so the
+        # human isn't confused about which file is authoritative.
+        legacy_md = proposal_dir / "proposal.md"
+        if legacy_md.exists():
+            try: legacy_md.unlink()
+            except Exception: pass
         console.print(
-            f"\n[bold green]proposal written:[/] {proposal_dir / 'proposal.md'}\n"
+            f"\n[bold green]proposal written:[/] {proposal_dir / 'proposal.html'}\n"
             f"[dim]sandbox job retained:[/] {sandbox_job_id} "
             f"(use `helios eval cleanup {run_id}` to remove)"
         )
@@ -1083,11 +1176,69 @@ REQUIRED FIRST STEP — understand the existing plan via EXPLAIN:
        at the bottleneck.
     6. ONLY THEN reason about which optimization category to apply.
 
-OPTIMIZATION PRIORITY ORDER — try in this sequence, stop when you find a real win:
+OPTIMIZATION TIER SELECTION — choose based on what EXPLAIN tells you:
 
-  Categories 1-5 don't change WHAT the query computes; only category 6 does.
-  Most successful prod optimizations live in 1-5 — try them FIRST.
-  Reaching category 6 should be a last resort, not a first instinct.
+  DO NOT follow a fixed 1→6 ordering. Read
+  `explain_query.combined_warnings` and `summary.max_estimated_rowcount`
+  FIRST, then pick the tier that matches the bottleneck shape.
+
+  ── EXECUTION-bound (algebra is fine; execution is suboptimal) ──
+    Symptoms: SortMergeJoin where BROADCAST would work; the same
+    relation scanned 2+ times in the plan (CACHE candidate); heavy
+    shuffles; max_estimated_rowcount stays within ~1–10× the largest
+    input table. CartesianProduct / BroadcastNestedLoopJoin may be
+    present but over small/medium inputs.
+    Approach: try Categories 1–5 (config, hints, caching, predicate
+    pushdown, table maintenance). STACK applicable ones — pass the
+    +15% Tier-3 floor and keep layering on remaining candidates that
+    `combined_warnings` flags before declaring done. Each layered
+    change still requires `explain_query → upload → run → diff_tables`;
+    revert any change that breaks equivalence OR fails to add ≥5%
+    additional perf.
+
+  ── STRUCTURAL / CARDINALITY-bound (the algebra produces an
+     explosive intermediate that Cat 1-5 cannot shrink) ──
+    Symptoms: `summary.max_estimated_rowcount >= 1e9` (a 1B+ row
+    intermediate); `combined_warnings` flags "STRUCTURAL bottleneck —
+    go directly to Category-6"; CartesianProduct of large inputs
+    (e.g. 464M × 354 = ~40B); BroadcastNestedLoopJoin over large
+    inputs.
+    Approach: Categories 1-5 are BOUNDED by the explosive intermediate
+    they cannot collapse — no amount of BROADCAST/CACHE/RANGE_JOIN
+    can shrink a 40B-row cross-join product. Jump STRAIGHT to
+    Category 6 algebraic rewrite. The four highest-leverage rewrites
+    in this class:
+      1. **Pre-aggregate BEFORE cross-joins.** Turn the LHS into a
+         dimension-grouped intermediate (k rows ≪ N) before the
+         cross-join. A 464M → 436K pre-aggregation turns a 40B
+         intermediate into ~38M (1000× shrink).
+      2. **Replace LEFT JOIN with INNER when the RHS is sparse.**
+         If only 5% of LHS has matching rows on the RHS, LEFT JOIN
+         keeps the unmatched 95% and downstream operations
+         multiply that. INNER JOIN drops them upfront.
+      3. **Replace non-equi (range / interval) joins with window
+         functions.** A "week N belongs to weeks-since-install"
+         join can become `SUM(...) OVER (PARTITION BY p_key
+         ORDER BY week_num ROWS BETWEEN UNBOUNDED PRECEDING AND
+         CURRENT ROW)` — same result, no inequality join.
+      4. **Materialize ONE intermediate at a smaller cardinality**
+         and downstream-consume it instead of recomputing per
+         downstream consumer.
+
+    Concrete recognition signal: if EXPLAIN reports an intermediate
+    operator's `rowCount` exceeding 1B and the prod task takes hours,
+    you are in this class — stop trying BROADCAST/CACHE/RANGE_JOIN
+    and rewrite the algebra. A historical example: a 464M × 354 =
+    ~40B intermediate caused a 3-hour prod task; pre-aggregation
+    + INNER join + window function brought it to ~15 minutes (91%
+    improvement). Categories 1-5 on the same task topped out at
+    29% — they cannot beat the structural shape.
+
+  Categories 1-5 changes preserve algebra; Category 6 changes algebra.
+  Category 6 still REQUIRES `diff_tables` after each change — algebra
+  rewrites are the dominant source of correctness failures. Verify each
+  change individually and revert on REAL_DIFFERENCE. One algebra change
+  per iteration, not several stacked.
 
   ── Category 1: CLUSTER + SPARK CONFIG (safest — no algebra change) ──
     • spark.sql.adaptive.enabled = true (leave AQE on; only disable for
@@ -1752,10 +1903,305 @@ def _tier1_from_equivalence(eq: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _measure_isolation_baseline(
+    *,
+    proposal_dir: Path,
+    clone_meta: dict[str, Any],
+    console: Console,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    """Run the ORIGINAL (unmodified) notebook in the sandbox on the same
+    pinned inputs and same cluster spec, writing to a separate `iso__` table.
+    Captures the runtime — an apples-to-apples baseline that removes prod's
+    co-tenant contention as a confound for Tier 3.
+
+    The Tier-3 number from this comparison answers
+    "did the OPTIMIZATION'S algebra make the query faster?" — distinct from
+    `vs prod_median` which conflates algebra improvement with contention
+    relief.
+
+    Cached in `{proposal_dir}/isolation.json` keyed on the original
+    notebook's sha256. Re-finalize reuses the cached value unless
+    `force=True`.
+    """
+    import hashlib
+    from datetime import datetime as _dt
+    from ..tools.databricks import (
+        upload_notebook, create_job, run_job_now, wait_for_job_run, get_job,
+        execute_sql,
+    )
+
+    orig_path = proposal_dir / "notebook_original.txt"
+    iso_path = proposal_dir / "isolation.json"
+    if not orig_path.exists():
+        console.print(
+            "[yellow]isolation baseline skipped: notebook_original.txt missing[/]"
+        )
+        return None
+    orig_source = orig_path.read_text()
+    sha = hashlib.sha256(orig_source.encode()).hexdigest()
+
+    # Cache hit?
+    if not force and iso_path.exists():
+        try:
+            cached = json.loads(iso_path.read_text())
+            if (cached.get("original_notebook_sha") == sha
+                    and cached.get("succeeded")):
+                console.print(
+                    f"  [dim]using cached isolation baseline "
+                    f"(duration {cached['duration_ms']/1000:.0f}s, captured "
+                    f"{cached.get('captured_at_iso', 'unknown')})[/]"
+                )
+                return cached
+        except Exception:
+            pass
+
+    # 1. Build the iso write-target mapping (parallel to main sandbox; tables
+    #    prefixed `iso__` so they don't collide with the optimized run).
+    write_orig = clone_meta.get("write_targets_original") or []
+    write_sb = clone_meta.get("write_targets_sandbox") or []
+    iso_mapping: dict[str, str] = {}
+    iso_tables: dict[str, str] = {}
+    for orig, sb in zip(write_orig, write_sb):
+        parts = sb.split(".")
+        iso_tbl = f"iso__{parts[-1]}"
+        iso_fqn = ".".join(parts[:-1] + [iso_tbl])
+        iso_mapping[orig] = iso_fqn
+        iso_tables[orig] = iso_fqn
+    if not iso_mapping:
+        console.print(
+            "[yellow]isolation baseline skipped: no write targets in clone_meta[/]"
+        )
+        return None
+
+    # 2. Rewrite the canonical original notebook: remap write targets to iso
+    #    paths + apply source pinning to the same alignment timestamp.
+    rewritten = rewrite_write_targets(orig_source, iso_mapping)
+    align_ts = clone_meta.get("source_alignment_timestamp")
+    if align_ts:
+        skip = set(iso_mapping.values()) | set(write_orig)
+        rewritten, _pinned, _warn = pin_sources_to_timestamp(
+            rewritten,
+            sorted(clone_meta.get("read_sources") or []),
+            align_ts,
+            skip=skip,
+        )
+
+    # 3. Upload as an isolation notebook in the same workspace dir as main.
+    sb_nb_path = clone_meta.get("sandbox_notebook_path") or ""
+    workspace_dir = "/".join(sb_nb_path.rstrip("/").split("/")[:-1])
+    task_key = clone_meta.get("task_key") or "task"
+    iso_nb_path = f"{workspace_dir}/isolation_{task_key}"
+    upload_notebook(
+        workspace_path=iso_nb_path, content=rewritten, language="PYTHON",
+    )
+
+    # 4. Build the isolation job — same cluster spec as the existing sandbox.
+    sandbox_job_id = int(clone_meta["sandbox_job_id"])
+    sb_job = get_job(sandbox_job_id)
+    settings = sb_job.get("settings") or {}
+    base_tasks = list(settings.get("tasks") or [])
+    if not base_tasks:
+        console.print(
+            "[red]isolation baseline: sandbox job has no tasks; aborting[/]"
+        )
+        return None
+    iso_task = dict(base_tasks[0])
+    iso_task["notebook_task"] = {
+        **(iso_task.get("notebook_task") or {}),
+        "notebook_path": iso_nb_path,
+        "source": "WORKSPACE",
+    }
+    iso_task["task_key"] = (
+        f"{iso_task.get('task_key', task_key)}__isolation"
+    )
+    iso_task.pop("depends_on", None)
+
+    run_id_label = clone_meta.get("run_id") or proposal_dir.name
+    job_settings: dict[str, Any] = {
+        "name": f"helios_isolation__{task_key}__{run_id_label}",
+        "tags": {
+            "helios_eval": "true",
+            "helios_eval_run_id": str(run_id_label),
+            "helios_eval_role": "isolation_baseline",
+            "helios_eval_source_job_id": str(clone_meta.get("prod_job_id") or ""),
+            "helios_eval_source_task_key": task_key,
+        },
+        "tasks": [iso_task],
+        "job_clusters": list(settings.get("job_clusters") or []),
+        "max_concurrent_runs": 1,
+    }
+    console.print(
+        f"[cyan]→ creating isolation baseline job "
+        f"(writing to {sorted(iso_tables.values())})[/]"
+    )
+    created = create_job(settings=job_settings)
+    iso_job_id = int(created["job_id"])
+
+    # 4b. Pre-create each iso write target by mirroring the prod table's
+    # schema (CREATE TABLE ... LIKE). Required because incremental notebooks
+    # (INSERT INTO / MERGE INTO) assume the target already exists — they
+    # typically have the CREATE statement commented out (a one-shot
+    # admin op). Without pre-creating, the iso job fails immediately with
+    # TABLE_OR_VIEW_NOT_FOUND. DROP IF EXISTS first so a re-run / retry
+    # starts from a clean empty table.
+    pre_create_errors: list[dict[str, str]] = []
+    for orig, iso_fqn in iso_mapping.items():
+        try:
+            execute_sql(f"DROP TABLE IF EXISTS {iso_fqn}", timeout_seconds=60)
+            execute_sql(
+                f"CREATE TABLE {iso_fqn} LIKE {orig}",
+                timeout_seconds=120,
+            )
+            console.print(
+                f"    [dim]pre-created iso table {iso_fqn} ← LIKE {orig}[/]"
+            )
+        except Exception as e:
+            msg = f"{type(e).__name__}: {e}"
+            console.print(
+                f"[yellow]pre-create iso table failed for {iso_fqn}: {msg}[/]"
+            )
+            pre_create_errors.append({"iso_fqn": iso_fqn, "error": msg})
+
+    # 5. Run + wait. Generous timeout — up to 6h handles most ETL tasks.
+    console.print(
+        f"[cyan]→ running isolation baseline job {iso_job_id} "
+        f"(this is the apples-to-apples control)[/]"
+    )
+    rn = run_job_now(iso_job_id)
+    iso_run_id = int(rn["run_id"])
+    opt = wait_for_job_run(
+        iso_run_id, timeout_seconds=21600, poll_interval_seconds=30,
+    )
+    succeeded = (
+        (not opt.get("timed_out"))
+        and opt.get("result_state") == "SUCCESS"
+    )
+    duration_ms = int(opt.get("execution_duration_ms") or 0)
+    console.print(
+        f"  isolation baseline {'SUCCESS' if succeeded else 'FAILED'} "
+        f"({duration_ms/1000:.0f}s, result_state={opt.get('result_state')})"
+    )
+
+    # If the iso job failed, try to capture the task's stderr/error trace
+    # so the proposal.md can show the actual SQL error (instead of just
+    # "FAILED"). Best-effort — keep going even if get_job_run_output fails.
+    failure_reason: str | None = None
+    if not succeeded:
+        try:
+            from ..tools.databricks import get_job_run, get_job_run_output
+            detail = get_job_run(iso_run_id)
+            tasks = detail.get("tasks") or []
+            for t in tasks:
+                if (t.get("state") or {}).get("result_state") == "FAILED":
+                    rid = t.get("run_id")
+                    if rid:
+                        out = get_job_run_output(int(rid))
+                        # Common fields: error, error_trace, notebook_output.result
+                        msg = (out.get("error") or "").strip()
+                        if not msg:
+                            tr = (out.get("error_trace") or "").strip()
+                            msg = tr.splitlines()[0] if tr else ""
+                        if msg:
+                            failure_reason = msg[:1000]
+                            break
+        except Exception:
+            pass
+
+    result = {
+        "original_notebook_sha": sha,
+        "iso_job_id": iso_job_id,
+        "iso_run_id": iso_run_id,
+        "iso_notebook_path": iso_nb_path,
+        "iso_sandbox_tables": iso_tables,
+        "duration_ms": duration_ms,
+        "succeeded": succeeded,
+        "result_state": opt.get("result_state"),
+        "failure_reason": failure_reason,
+        "pre_create_errors": pre_create_errors,
+        "captured_at": int(time.time()),
+        "captured_at_iso": _dt.utcnow().isoformat() + "Z",
+        "source_alignment_timestamp": align_ts,
+    }
+    try:
+        iso_path.write_text(json.dumps(result, indent=2, default=str))
+    except Exception:
+        pass
+    return result
+
+
+def _compute_tier3(
+    *,
+    optimized_succeeded: bool,
+    optimized_ms: int,
+    prod_median_ms: int,
+    isolation_ms: int | None,
+    pass_threshold_pct: float = 15.0,
+) -> dict[str, Any]:
+    """Apples-to-apples-aware Tier 3 scoring.
+
+    When `isolation_ms` is available (= the ORIGINAL notebook's runtime under
+    the same isolated sandbox conditions), the **algebra_impact** is the
+    primary gate — that's the apples-to-apples measurement. Without it we
+    fall back to `prod_shipping_impact` and flag that the algebra impact is
+    unmeasured.
+
+    Three deltas always reported when computable:
+      prod_shipping_impact = (prod_median - optimized) / prod_median
+      algebra_impact       = (isolation  - optimized) / isolation
+      contention_overhead  = (prod_median - isolation) / prod_median
+    """
+    def pct(num: int | None, denom: int | None) -> float | None:
+        if not denom or num is None:
+            return None
+        return round((denom - num) / denom * 100.0, 2)
+
+    prod_shipping_impact = (
+        pct(optimized_ms, prod_median_ms) if optimized_succeeded else None
+    )
+    algebra_impact = (
+        pct(optimized_ms, isolation_ms)
+        if (optimized_succeeded and isolation_ms) else None
+    )
+    contention_overhead = (
+        pct(isolation_ms, prod_median_ms)
+        if (isolation_ms and prod_median_ms) else None
+    )
+    if algebra_impact is not None:
+        primary_gate = "algebra_impact_pct"
+        passed = algebra_impact >= pass_threshold_pct
+    else:
+        primary_gate = "prod_shipping_impact_pct"
+        passed = (prod_shipping_impact or 0.0) >= pass_threshold_pct
+    passed = bool(passed) and optimized_succeeded
+
+    return {
+        "tier": 3,
+        "passed": passed,
+        "primary_gate": primary_gate,
+        "pass_threshold_pct": pass_threshold_pct,
+        "baseline_median_ms": prod_median_ms,
+        "isolation_baseline_ms": isolation_ms,
+        "optimized_ms": optimized_ms,
+        "prod_shipping_impact_pct": prod_shipping_impact,
+        "algebra_impact_pct": algebra_impact,
+        "contention_overhead_pct": contention_overhead,
+        # Legacy alias preserved for existing consumers / renderer paths.
+        "runtime_improvement_pct": (
+            algebra_impact if algebra_impact is not None
+            else (prod_shipping_impact or 0.0)
+        ),
+        # For renderer convenience.
+        "baseline_duration_ms": prod_median_ms,
+        "optimized_duration_ms": optimized_ms,
+    }
+
+
 def _score_proposal(
     *, history: HistoryBaseline, clone: TaskCloneResult,
     optimized_succeeded: bool, optimized_ms: int, agent_result,
     proposal_dir: Path, console: Console,
+    isolation_ms: int | None = None,
 ) -> dict[str, Any]:
     """Score the proposal — T1 (canonical diff_tables + LLM nondeterminism)
     + T3. Tier 2 disabled for propose (no fixture-defined required_tools).
@@ -1784,18 +2230,15 @@ def _score_proposal(
     tier1["passed"] = tier1["passed"] and tier1["output_equivalence"]
     tier1["job_completion"] = optimized_succeeded
 
-    # Tier 3 — improvement vs baseline median.
-    if optimized_succeeded and history.median_duration_ms > 0:
-        delta_pct = (history.median_duration_ms - optimized_ms) / history.median_duration_ms * 100
-    else:
-        delta_pct = 0.0
-    tier3 = {
-        "tier": 3,
-        "passed": optimized_succeeded and delta_pct > 0,
-        "baseline_median_ms": history.median_duration_ms,
-        "optimized_ms": optimized_ms,
-        "runtime_improvement_pct": round(delta_pct, 2),
-    }
+    # Tier 3 via the shared apples-to-apples-aware helper. When an isolation
+    # baseline is available, algebra_impact (uncontended) is the primary
+    # gate; otherwise we fall back to prod_shipping_impact and flag the gap.
+    tier3 = _compute_tier3(
+        optimized_succeeded=optimized_succeeded,
+        optimized_ms=optimized_ms,
+        prod_median_ms=history.median_duration_ms,
+        isolation_ms=isolation_ms,
+    )
 
     return {
         "tier1": tier1,
@@ -1803,6 +2246,741 @@ def _score_proposal(
         "nondeterminism": eq["nondeterminism"],
         "tier1_full_detail": eq["per_table"],
     }
+
+
+_EVALUATOR_VERDICT_SEVERITY = {
+    "SHIPPABLE": 0, "SHIP_WITH_CAVEATS": 1, "DO_NOT_SHIP": 2,
+}
+
+
+def _worst_evaluator_verdict(verdicts: list[str | None]) -> str | None:
+    """Worst-of (most-severe) verdict across multiple per-table evaluator
+    runs. Returns None if the input is empty or all-None."""
+    real = [v for v in verdicts if v in _EVALUATOR_VERDICT_SEVERITY]
+    if not real:
+        return None
+    worst_score = max(_EVALUATOR_VERDICT_SEVERITY[v] for v in real)
+    for k, v in _EVALUATOR_VERDICT_SEVERITY.items():
+        if v == worst_score:
+            return k
+    return None
+
+
+def _normalize_evaluator_payload(ev: Any) -> dict[str, Any] | None:
+    """Coerce summary["evaluator"] to the canonical multi-target shape
+    {per_table: {fqn: result, ...}, aggregate_verdict, n_targets_*}. Handles:
+      - None → return None
+      - already-multi-target dict (has 'per_table') → return as-is
+      - legacy single-table dict (has 'verdict' at top level) → wrap as
+        {"per_table": {"<unknown>": ev}, ...} for backward-compat rendering
+    """
+    if not ev or not isinstance(ev, dict):
+        return None
+    if "per_table" in ev:
+        return ev
+    # Legacy single-target shape — wrap so the renderer can iterate.
+    return {
+        "per_table": {"(table)": ev},
+        "aggregate_verdict": ev.get("verdict"),
+        "n_targets_evaluated": 1,
+        "n_targets_total": 1,
+    }
+
+
+def _h(s: Any) -> str:
+    """HTML-escape helper used by the HTML renderers below."""
+    import html as _html_mod
+    return _html_mod.escape(str(s if s is not None else ""))
+
+
+def _ipynb_to_source(nb_json: str) -> str:
+    """Convert a Jupyter .ipynb JSON document to Databricks SOURCE-format
+    text. Used to normalize both sides of the notebook diff: the pre-agent
+    notebook is stored as the original .ipynb JSON (that's how git stores
+    them in the Pocket-Fm repo), while the agent's optimized notebook is
+    always returned by `get_notebook_source()` as SOURCE format (Databricks
+    converts JUPYTER → SOURCE on export). Diffing those two raw forms shows
+    100% of the JSON envelope as deletions and the real SQL changes are
+    buried; converting to a common format gives a readable diff.
+
+    Output shape mirrors what Databricks emits when exporting a notebook
+    as SOURCE: leading `-- Databricks notebook source` marker, then each
+    cell separated by `-- COMMAND ----------`, with optional `-- DBTITLE`
+    pulled from cell metadata. Markdown cells are emitted with `-- MAGIC
+    %md` prefix per Databricks convention.
+
+    If input isn't valid .ipynb JSON, returns it unchanged (safe pass-
+    through for already-SOURCE-format text or unparseable junk).
+    """
+    if not nb_json:
+        return ""
+    stripped = nb_json.lstrip()
+    if not stripped.startswith("{"):
+        return nb_json
+    try:
+        nb = json.loads(nb_json)
+    except json.JSONDecodeError:
+        return nb_json
+    if not isinstance(nb, dict) or "cells" not in nb:
+        return nb_json
+
+    parts: list[str] = ["-- Databricks notebook source"]
+    for cell in (nb.get("cells") or []):
+        if not isinstance(cell, dict):
+            continue
+        ct = cell.get("cell_type")
+        if ct not in ("code", "markdown"):
+            continue
+        src_field = cell.get("source") or []
+        if isinstance(src_field, list):
+            src_text = "".join(src_field)
+        elif isinstance(src_field, str):
+            src_text = src_field
+        else:
+            continue
+        src_text = src_text.rstrip("\n")
+        if not src_text.strip():
+            continue
+        meta = (
+            (cell.get("metadata") or {})
+            .get("application/vnd.databricks.v1+cell") or {}
+        )
+        title = (meta.get("title") or "").strip()
+
+        parts.append("")
+        parts.append("-- COMMAND ----------")
+        if ct == "markdown":
+            parts.append("-- MAGIC %md")
+            for line in src_text.split("\n"):
+                parts.append(f"-- MAGIC {line}" if line else "-- MAGIC ")
+        else:
+            if title:
+                parts.append(f"-- DBTITLE 1,{title}")
+            parts.append(src_text)
+    return "\n".join(parts) + "\n"
+
+
+def _normalize_notebook_for_diff(content: str) -> str:
+    """Diff-prep: if `content` is a Jupyter .ipynb JSON document, convert it
+    to SOURCE format via `_ipynb_to_source`. Otherwise return unchanged."""
+    return _ipynb_to_source(content)
+
+
+_HTML_HEAD = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Proposal: {title}</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+          max-width: 1080px; margin: 2em auto; padding: 0 1.2em; line-height: 1.55;
+          color: #1f2328; background: #fff; }}
+  h1, h2, h3, h4 {{ margin-top: 1.6em; margin-bottom: 0.4em; }}
+  h1 {{ font-size: 1.5em; border-bottom: 1px solid #d0d7de; padding-bottom: 0.3em; }}
+  h2 {{ font-size: 1.25em; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }}
+  h3 {{ font-size: 1.05em; }}
+  details {{ margin: 0.9em 0; border: 1px solid #d0d7de; border-radius: 6px;
+            padding: 0.7em 1em; background: #fbfcfd; }}
+  details summary {{ cursor: pointer; font-weight: 600; padding: 0.2em 0;
+                    list-style: none; outline: none; }}
+  details summary::-webkit-details-marker {{ display: none; }}
+  details summary::before {{ content: "▶ "; display: inline-block;
+                            transition: transform 0.15s; color: #57606a; }}
+  details[open] summary::before {{ transform: rotate(90deg); }}
+  details[open] summary {{ border-bottom: 1px solid #eaecef;
+                          margin-bottom: 0.7em; padding-bottom: 0.5em; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 0.8em 0; font-size: 0.93em; }}
+  th, td {{ border: 1px solid #d0d7de; padding: 0.45em 0.7em; text-align: left;
+           vertical-align: top; }}
+  th {{ background: #f6f8fa; font-weight: 600; }}
+  tr:nth-child(even) td {{ background: #fafbfc; }}
+  code {{ background: #f6f8fa; padding: 0.1em 0.4em; border-radius: 3px;
+         font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+         font-size: 0.88em; }}
+  pre {{ background: #f6f8fa; padding: 0.9em 1em; border-radius: 6px;
+         overflow-x: auto; font-size: 0.83em; line-height: 1.4;
+         border: 1px solid #d0d7de; }}
+  .pass {{ color: #1a7f37; font-weight: 600; }}
+  .fail {{ color: #cf222e; font-weight: 600; }}
+  .warn {{ color: #9a6700; font-weight: 600; }}
+  .verdict-banner {{ padding: 1em 1.2em; border-radius: 8px; margin: 1.2em 0;
+                    border-left: 4px solid #57606a; background: #f6f8fa; }}
+  .verdict-pass {{ background: #dafbe1; border-left-color: #1a7f37; }}
+  .verdict-warn {{ background: #fff8c5; border-left-color: #9a6700; }}
+  .verdict-fail {{ background: #ffebe9; border-left-color: #cf222e; }}
+  .kv {{ display: grid; grid-template-columns: max-content auto;
+        column-gap: 1em; row-gap: 0.2em; margin: 0.6em 0; font-size: 0.95em; }}
+  .kv dt {{ color: #57606a; }}
+  .kv dd {{ margin: 0; }}
+  .anomaly-low {{ color: #1a7f37; }}
+  .anomaly-medium {{ color: #9a6700; }}
+  .anomaly-high {{ color: #cf222e; }}
+  blockquote {{ border-left: 4px solid #9a6700; background: #fff8c5;
+                margin: 0.8em 0; padding: 0.6em 1em; border-radius: 0 6px 6px 0; }}
+  .footnote {{ color: #57606a; font-size: 0.88em; }}
+</style>
+</head>
+<body>
+"""
+
+_HTML_FOOT = "\n</body>\n</html>\n"
+
+
+def _verdict_banner_html(
+    passed_t1: bool, passed_t3: bool,
+    eval_verdict: str | None = None,
+) -> tuple[str, str]:
+    """Compute (banner_class, status_text) given the gate states + evaluator."""
+    overall_pass = passed_t1 and passed_t3
+    if eval_verdict == "DO_NOT_SHIP":
+        return ("verdict-fail", "❌ DO NOT SHIP — independent evaluator flagged real divergence")
+    if not overall_pass:
+        return ("verdict-warn", "⚠️ NEEDS REVIEW — deterministic gates did not all pass")
+    if eval_verdict == "SHIP_WITH_CAVEATS":
+        return ("verdict-warn", "⚠️ PASS WITH CAVEATS — deterministic gates pass; evaluator flagged caveats")
+    return ("verdict-pass", "✅ PASS")
+
+
+def _render_evaluator_section_html(summary: dict[str, Any]) -> str:
+    """Render the independent evaluator agent verdict(s). Handles single-
+    target and multi-target shapes uniformly via `_normalize_evaluator_payload`."""
+    ev = _normalize_evaluator_payload(summary.get("evaluator"))
+    if not ev:
+        return (
+            "<details>\n"
+            "  <summary>Independent evaluator agent</summary>\n"
+            "  <p class='footnote'>The independent evaluator agent did not produce a verdict for this run "
+            "(graceful skip — module failure, LLM error, or unparseable JSON). Proceeding with the "
+            "deterministic verdict only. To re-attempt, run "
+            f"<code>helios propose-finalize {_h(summary.get('run_id'))}</code> again.</p>\n"
+            "</details>\n"
+        )
+
+    per_table = ev.get("per_table") or {}
+    aggregate = ev.get("aggregate_verdict")
+    n_eval = ev.get("n_targets_evaluated", len(per_table))
+    n_total = ev.get("n_targets_total", n_eval)
+
+    agg_class = {
+        "SHIPPABLE": "pass", "SHIP_WITH_CAVEATS": "warn", "DO_NOT_SHIP": "fail",
+    }.get(aggregate, "warn")
+    target_label = (
+        f"target <code>{_h(next(iter(per_table)))}</code>"
+        if n_total == 1 else
+        f"{n_eval}/{n_total} targets (worst-of)"
+    )
+
+    # Render one block per write target.
+    target_blocks: list[str] = []
+    for orig, target_ev in per_table.items():
+        verdict = target_ev.get("verdict", "UNKNOWN")
+        color_class = {
+            "SHIPPABLE": "pass", "SHIP_WITH_CAVEATS": "warn", "DO_NOT_SHIP": "fail",
+        }.get(verdict, "warn")
+        narrative = _h(target_ev.get("narrative", ""))
+        row_counts = target_ev.get("row_counts") or {}
+        rc_html = ""
+        if row_counts:
+            rc_html = (
+                "<dl class='kv'>"
+                f"<dt>prod rows</dt><dd>{_h(row_counts.get('prod'))}</dd>"
+                f"<dt>sandbox rows</dt><dd>{_h(row_counts.get('sandbox'))}</dd>"
+                f"<dt>match</dt><dd>{_h(row_counts.get('match'))}</dd>"
+                "</dl>"
+            )
+        anomalies = target_ev.get("anomalies") or []
+        anom_html = ""
+        if anomalies:
+            rows = []
+            for a in anomalies:
+                sev = (a.get("severity") or "MEDIUM").upper()
+                sev_class = {"LOW": "anomaly-low", "MEDIUM": "anomaly-medium",
+                             "HIGH": "anomaly-high"}.get(sev, "anomaly-medium")
+                rows.append(
+                    "<tr>"
+                    f"<td><code>{_h(a.get('column'))}</code></td>"
+                    f"<td>{_h(a.get('category'))}</td>"
+                    f"<td style='text-align:right'>{int(a.get('rows_affected') or 0):,}</td>"
+                    f"<td class='{sev_class}'>{_h(sev)}</td>"
+                    f"<td>{_h(a.get('evidence'))}</td>"
+                    f"<td>{_h(a.get('explanation_in_sql'))}</td>"
+                    f"<td>{_h(a.get('downstream_risk'))}</td>"
+                    "</tr>"
+                )
+            anom_html = (
+                "<table>\n"
+                "<thead><tr>"
+                "<th>Column</th><th>Category</th><th>Rows affected</th>"
+                "<th>Severity</th><th>Evidence</th>"
+                "<th>SQL explanation</th><th>Downstream risk</th>"
+                "</tr></thead>\n"
+                f"<tbody>\n{chr(10).join(rows)}\n</tbody>\n</table>\n"
+            )
+        else:
+            anom_html = "<p>No anomalies observed.</p>\n"
+
+        inv_log = target_ev.get("investigation_log") or []
+        inv_html = ""
+        if inv_log:
+            inv_rows = []
+            for q in inv_log:
+                inv_rows.append(
+                    "<tr>"
+                    f"<td><pre style='margin:0; font-size: 0.82em;'>{_h((q.get('query') or '')[:600])}</pre></td>"
+                    f"<td>{_h(q.get('finding'))}</td>"
+                    "</tr>"
+                )
+            inv_html = (
+                "<details>\n  <summary>Investigation log "
+                f"({len(inv_log)} queries)</summary>\n"
+                "  <table>\n  <thead><tr><th>Query</th><th>Finding</th></tr></thead>\n"
+                f"  <tbody>{chr(10).join(inv_rows)}</tbody>\n  </table>\n</details>\n"
+            )
+
+        # Each target gets its own inner <details>, expanded if N==1 or
+        # the verdict is non-trivial.
+        target_open = " open" if (n_total == 1 or verdict != "SHIPPABLE") else ""
+        target_blocks.append(
+            f"<details{target_open}>\n"
+            f"  <summary>Target <code>{_h(orig)}</code>: "
+            f"<span class='{color_class}'>{_h(verdict)}</span> "
+            f"({len(anomalies)} anomalies)</summary>\n"
+            f"  <p>{narrative}</p>\n"
+            f"  {rc_html}\n"
+            f"  <h4>Anomalies</h4>\n"
+            f"  {anom_html}\n"
+            f"  {inv_html}\n"
+            f"  <p class='footnote'>Model: <code>{_h(target_ev.get('model'))}</code>, "
+            f"completed in {_h(target_ev.get('elapsed_seconds'))}s. "
+            f"Raw JSON: <code>"
+            + ("evaluator.json" if n_total == 1 else f"evaluator__{re.sub(r'[^A-Za-z0-9_]+', '__', orig)}.json")
+            + "</code>.</p>\n"
+            "</details>\n"
+        )
+
+    return (
+        "<details open>\n"
+        f"  <summary>Independent evaluator agent — aggregate verdict: "
+        f"<span class='{agg_class}'>{_h(aggregate)}</span> "
+        f"({target_label})</summary>\n"
+        + "".join(target_blocks)
+        + "  <p class='footnote'>This verdict is ADVISORY and does not gate "
+        "Tier-1/Tier-3 PASS. The aggregate is the worst-of across all "
+        "evaluated targets (DO_NOT_SHIP &gt; SHIP_WITH_CAVEATS &gt; SHIPPABLE). "
+        + (
+            "Combined JSON: <code>evaluator.json</code>." if n_total > 1
+            else ""
+        )
+        + "</p>\n"
+        "</details>\n"
+    )
+
+
+def _render_nd_section_html(summary: dict[str, Any]) -> str:
+    """HTML version of the nondeterminism (LLM column classifier) section."""
+    nd_all = summary.get("nondeterminism") or {}
+    full_detail = summary.get("tier1_full_detail") or {}
+    if not nd_all:
+        return ""
+    parts: list[str] = []
+    parts.append(
+        "<details>\n"
+        "  <summary>Nondeterministic output columns (LLM analysis of original query)</summary>\n"
+    )
+    for orig, nd in nd_all.items():
+        cols = nd.get("columns") or {}
+        flagged = nd.get("nondeterministic_columns") or []
+        if not flagged:
+            parts.append(
+                f"  <p><code>{_h(orig)}</code>: no nondeterministic output "
+                "columns detected — all values are pure functions of pinned inputs.</p>\n"
+            )
+            continue
+        eff = (full_detail.get(orig, {}) or {}).get("effective_ignore_columns", [])
+        parts.append(f"  <h3><code>{_h(orig)}</code> — model <code>{_h(nd.get('model'))}</code></h3>\n")
+        rows = []
+        for c in flagged:
+            e = cols.get(c, {})
+            excluded = "✅ yes" if c in eff else "❌ no (needs probe)"
+            rows.append(
+                "<tr>"
+                f"<td><code>{_h(c)}</code></td>"
+                f"<td>{_h(e.get('class'))}</td>"
+                f"<td>{_h(e.get('authorization'))}</td>"
+                f"<td>{_h(excluded)}</td>"
+                f"<td>{_h(e.get('rationale'))}</td>"
+                "</tr>"
+            )
+        parts.append(
+            "  <table><thead><tr>"
+            "<th>Column</th><th>Class</th><th>Authorization</th>"
+            "<th>Excluded from diff?</th><th>Rationale</th>"
+            f"</tr></thead><tbody>{chr(10).join(rows)}</tbody></table>\n"
+        )
+        # Tie-break corroboration sub-block.
+        tbc = (full_detail.get(orig, {}) or {}).get("tie_break_corroboration") or []
+        if tbc:
+            tbc_rows = []
+            for t in tbc:
+                v = t.get("verdict", "")
+                vmark = {
+                    "TIE_BREAK_CONFIRMED": "✅ TIE_BREAK_CONFIRMED",
+                    "DETERMINISTIC_EMPIRICALLY": "ℹ️ DETERMINISTIC_EMPIRICALLY",
+                    "POSSIBLE_REAL_BUG": "❌ POSSIBLE_REAL_BUG",
+                    "DIFFERS_NO_SIBLING_TO_CHECK": "⚠️ DIFFERS_NO_SIBLING_TO_CHECK",
+                }.get(v, v)
+                sib = t.get("sibling")
+                sib_cell = f"<code>{_h(sib)}</code>" if sib else "—"
+                sm = f"{int(t.get('sibling_SAME') or 0):,}" if sib else "—"
+                sd = f"{int(t.get('sibling_DIFF') or 0):,}" if sib else "—"
+                tbc_rows.append(
+                    "<tr>"
+                    f"<td><code>{_h(t.get('column'))}</code></td>"
+                    f"<td>{sib_cell}</td>"
+                    f"<td style='text-align:right'>{int(t.get('diff_total') or 0):,}</td>"
+                    f"<td style='text-align:right'>{sm}</td>"
+                    f"<td style='text-align:right'>{sd}</td>"
+                    f"<td>{_h(vmark)}</td>"
+                    "</tr>"
+                )
+            parts.append(
+                "  <h4>Tie-break corroboration (empirical)</h4>\n"
+                "  <table><thead><tr>"
+                "<th>Column</th><th>ORDER BY sibling</th><th>Rows differ</th>"
+                "<th>Sibling matches</th><th>Sibling differs</th><th>Verdict</th>"
+                f"</tr></thead><tbody>{chr(10).join(tbc_rows)}</tbody></table>\n"
+            )
+    parts.append("</details>\n")
+    return "".join(parts)
+
+
+def _render_finalize_html(
+    *, summary: dict[str, Any], clone_meta: dict[str, Any], proposal_dir: Path,
+) -> str:
+    """HTML renderer for proposal.html — collapsible, browser-friendly,
+    used by finalize() (and propose-resume via the same path).
+
+    Same data sources as the legacy _render_finalize_md but structured as
+    HTML with <details>/<summary> for everything except the headline
+    verdict + TL;DR + per-table equivalence table.
+    """
+    import difflib
+    from ..tools.databricks import get_notebook_source
+
+    t1 = summary["scores"]["tier1"]
+    t3 = summary["scores"]["tier3"]
+    ev = _normalize_evaluator_payload(summary.get("evaluator"))
+    # Aggregate verdict drives the banner / TL;DR. For single-target runs
+    # this equals the lone per-table verdict; for multi-target it's worst-of.
+    eval_verdict = (ev or {}).get("aggregate_verdict")
+
+    banner_class, banner_text = _verdict_banner_html(
+        bool(t1.get("passed")), bool(t3.get("passed")), eval_verdict,
+    )
+
+    # --- Per-table equivalence table ---
+    full_detail = summary.get("tier1_full_detail") or {}
+    per_table_rows = []
+    increment_blocks_html = []
+    for orig, info in (t1.get("per_table") or {}).items():
+        b = info.get("buckets") or {}
+        det = full_detail.get(orig, {}) or {}
+        mode = det.get("mode") or "full_rewrite"
+        v = info.get("verdict") or "?"
+        v_class = {"IDENTICAL": "pass", "FLOAT_REORDER_ONLY": "pass",
+                   "REAL_DIFFERENCE": "fail"}.get(v, "warn")
+        per_table_rows.append(
+            "<tr>"
+            f"<td><code>{_h(orig)}</code></td>"
+            f"<td>{_h(mode)}</td>"
+            f"<td class='{v_class}'>{_h(v)}</td>"
+            f"<td style='text-align:right'>{int(b.get('identical', 0)):,}</td>"
+            f"<td style='text-align:right'>{int(b.get('extra_in_b', 0)):,}</td>"
+            f"<td style='text-align:right'>{int(b.get('missing_from_b', 0)):,}</td>"
+            f"<td style='text-align:right'>{int(b.get('same_key_drifted_metric', 0)):,}</td>"
+            "</tr>"
+        )
+        inc = det.get("increment")
+        if inc:
+            pre = inc.get('pre_version')
+            post = inc.get('post_version')
+            wh = inc.get('where_clause')
+            ex = inc.get('used_except')
+            increment_blocks_html.append(
+                f"<li><code>{_h(orig)}</code>: compared <strong>prod increment</strong> "
+                f"(v{_h(post)}" + (f" EXCEPT v{_h(pre)}" if ex else "") +
+                (f" WHERE <code>{_h(wh)}</code>" if wh else "") +
+                ") vs sandbox. Prod's accumulated history is not in scope; only the rows "
+                "this task's commit added/modified.</li>"
+            )
+
+    per_table_table = (
+        "<table><thead><tr>"
+        "<th>Boundary table</th><th>Mode</th><th>Verdict</th>"
+        "<th>Identical</th><th>Extra in sandbox</th><th>Missing</th>"
+        "<th>Drifted-metric</th>"
+        f"</tr></thead><tbody>{chr(10).join(per_table_rows)}</tbody></table>"
+    )
+    increment_section_html = (
+        f"<details><summary>Incremental scope details "
+        f"({len(increment_blocks_html)} target(s))</summary>"
+        f"<ul>{chr(10).join(increment_blocks_html)}</ul></details>"
+        if increment_blocks_html else ""
+    )
+
+    # --- Per-column drift profile (exhaustive) ---
+    drift_profile_html = ""
+    for orig, det in full_detail.items():
+        mp = det.get("metric_summary") or {}
+        if not mp:
+            continue
+        rows = []
+        for col, m in mp.items():
+            d = int(m.get("rows_drifted") or 0)
+            if d == 0:
+                continue
+            type_str = m.get("type") or ""
+            ma = m.get("max_abs_diff")
+            mr = m.get("max_rel_diff")
+            ma_s = "—" if ma is None else f"{ma:.3e}"
+            mr_s = "—" if mr is None else f"{mr:.3e}"
+            rows.append(
+                "<tr>"
+                f"<td><code>{_h(col)}</code></td>"
+                f"<td>{_h(type_str)}</td>"
+                f"<td style='text-align:right'>{d:,}</td>"
+                f"<td style='text-align:right'>{ma_s}</td>"
+                f"<td style='text-align:right'>{mr_s}</td>"
+                "</tr>"
+            )
+        if rows:
+            drift_profile_html += (
+                "<details>\n"
+                f"  <summary>Per-column drift profile for <code>{_h(orig)}</code></summary>\n"
+                "  <table><thead><tr>"
+                "<th>Column</th><th>Type</th><th>Rows drifted</th>"
+                "<th>Max abs diff</th><th>Max rel diff</th>"
+                f"</tr></thead><tbody>{chr(10).join(rows)}</tbody></table>\n"
+                "  <p class='footnote'>If <code>Max abs/rel diff</code> are "
+                "<code>—</code> but rows_drifted is large, the drift is most "
+                "likely NULL-vs-value asymmetry (not float reorder). The "
+                "independent evaluator section above will have classified it.</p>\n"
+                "</details>\n"
+            )
+
+    # --- TL;DR table (deterministic + evaluator + perf) ---
+    base_ms = summary['baseline'].get('median_duration_ms', 0) or 0
+    iso_ms = t3.get("isolation_baseline_ms")
+    opt_ms = t3.get("optimized_duration_ms") or 0
+    tldr_rows = [
+        f"<tr><td>Prod median runtime{' (with co-tenant contention)' if iso_ms else ''}</td>"
+        f"<td>{base_ms/1000:.0f}s ({base_ms/60000:.1f} min)</td></tr>"
+    ]
+    if iso_ms:
+        tldr_rows.append(
+            f"<tr><td>Isolation baseline (original notebook in sandbox)</td>"
+            f"<td>{iso_ms/1000:.0f}s ({iso_ms/60000:.1f} min)</td></tr>"
+        )
+    tldr_rows.extend([
+        f"<tr><td>Optimized runtime (in sandbox)</td>"
+        f"<td>{opt_ms/1000:.0f}s ({opt_ms/60000:.1f} min)</td></tr>"
+    ])
+    if iso_ms:
+        algebra = t3.get("algebra_impact_pct")
+        prod_imp = t3.get("prod_shipping_impact_pct") or 0
+        conten = t3.get("contention_overhead_pct") or 0
+        algebra_s = "—" if algebra is None else f"{algebra:+.1f}%"
+        tldr_rows.append(
+            f"<tr><td><strong>Algebra impact (primary gate)</strong></td>"
+            f"<td><strong>{algebra_s}</strong> {'✅' if t3.get('passed') else '❌'}</td></tr>"
+        )
+        tldr_rows.append(
+            f"<tr><td>Prod shipping impact (includes contention relief)</td>"
+            f"<td>{prod_imp:+.1f}%</td></tr>"
+        )
+        tldr_rows.append(
+            f"<tr><td>Contention overhead in prod</td>"
+            f"<td>{conten:+.1f}%</td></tr>"
+        )
+    else:
+        prod_imp = t3.get("prod_shipping_impact_pct") or 0
+        tldr_rows.append(
+            f"<tr><td><strong>Runtime improvement vs prod median</strong></td>"
+            f"<td><strong>{prod_imp:+.1f}%</strong> "
+            f"{'✅' if t3.get('passed') else '❌'}<br>"
+            "<span class='footnote'>⚠️ Includes contention relief — pass "
+            "<code>--isolation-baseline</code> for apples-to-apples.</span></td></tr>"
+        )
+    # Tier rows
+    tldr_rows.append(
+        f"<tr><td>Tier 1 (row-level equivalence — deterministic)</td>"
+        f"<td><span class='{'pass' if t1.get('passed') else 'fail'}'>"
+        f"{'PASS' if t1.get('passed') else 'FAIL'}</span> "
+        f"(verdict: {_h(t1.get('equivalence_verdict'))})</td></tr>"
+    )
+    if ev:
+        ev_class = {"SHIPPABLE": "pass", "SHIP_WITH_CAVEATS": "warn",
+                    "DO_NOT_SHIP": "fail"}.get(eval_verdict, "warn")
+        per_table = ev.get("per_table") or {}
+        total = ev.get("n_targets_total", len(per_table))
+        # Total anomaly count across all targets
+        total_anom = sum(
+            len((t.get("anomalies") or [])) for t in per_table.values()
+        )
+        if total <= 1:
+            detail = f"({total_anom} anomalies)"
+        else:
+            # Multi-target: show per-target breakdown
+            from collections import Counter
+            verdict_counts = Counter(
+                t.get("verdict") for t in per_table.values()
+            )
+            parts = []
+            for v in ("SHIPPABLE", "SHIP_WITH_CAVEATS", "DO_NOT_SHIP"):
+                if verdict_counts.get(v):
+                    parts.append(f"{verdict_counts[v]} {v}")
+            detail = (
+                f"({total_anom} anomalies across "
+                f"{len(per_table)}/{total} targets: {', '.join(parts)})"
+            )
+        tldr_rows.append(
+            f"<tr><td>Tier 1 (independent evaluator — advisory)</td>"
+            f"<td><span class='{ev_class}'>{_h(eval_verdict)}</span> "
+            f"{detail}</td></tr>"
+        )
+    else:
+        tldr_rows.append(
+            f"<tr><td>Tier 1 (independent evaluator — advisory)</td>"
+            f"<td><span class='warn'>NOT RUN</span></td></tr>"
+        )
+    tldr_rows.append(
+        f"<tr><td>Tier 3 (perf ≥{t3.get('pass_threshold_pct', 15.0):.0f}%) "
+        f"— gate: <code>{_h(t3.get('primary_gate'))}</code></td>"
+        f"<td><span class='{'pass' if t3.get('passed') else 'fail'}'>"
+        f"{'PASS' if t3.get('passed') else 'FAIL'}</span></td></tr>"
+    )
+    tldr_table = (
+        "<table><thead><tr><th>Metric</th><th>Value</th></tr></thead>\n"
+        f"<tbody>{chr(10).join(tldr_rows)}</tbody></table>"
+    )
+
+    # --- Notebook diff (collapsed) ---
+    # Both sides normalized to Databricks SOURCE format before diffing.
+    # The pre-agent notebook is stored as .ipynb JSON (git source format),
+    # while the agent's optimized notebook is exported as SOURCE. Diffing
+    # those two raw forms drowns the real SQL changes in JSON envelope
+    # noise. _normalize_notebook_for_diff converts .ipynb → SOURCE so the
+    # diff shows only the actual SQL edits.
+    diff_html = ""
+    pre_path = proposal_dir / "notebook_sandbox_pre_agent.txt"
+    if pre_path.exists():
+        try:
+            current_raw = get_notebook_source(clone_meta["sandbox_notebook_path"])["content"]
+            pre_raw = pre_path.read_text()
+            pre = _normalize_notebook_for_diff(pre_raw)
+            current = _normalize_notebook_for_diff(current_raw)
+            ud = "".join(difflib.unified_diff(
+                pre.splitlines(keepends=True), current.splitlines(keepends=True),
+                fromfile="pre_agent (SQL)", tofile="agent_optimized (SQL)", n=3,
+            ))
+            if ud:
+                # Cap to 12KB so the HTML stays manageable.
+                shown = ud[:12000]
+                trunc = "" if len(ud) <= 12000 else f"\n\n[...truncated, full diff is {len(ud)} chars...]"
+                # Indicate whether we normalized either side (helps the human
+                # understand why the diff looks cleaner than the raw files).
+                normalized_note = ""
+                if pre_raw != pre or current_raw != current:
+                    sides = []
+                    if pre_raw != pre: sides.append("pre_agent")
+                    if current_raw != current: sides.append("agent_optimized")
+                    normalized_note = (
+                        f"<p class='footnote'>Diff normalized to SOURCE "
+                        f"format on: {', '.join(sides)} (raw was .ipynb "
+                        "JSON envelope — converted to bare SQL cells for "
+                        "readability).</p>\n"
+                    )
+                diff_html = (
+                    "<details>\n<summary>Agent's notebook changes (unified diff)</summary>\n"
+                    f"{normalized_note}"
+                    f"<pre>{_h(shown + trunc)}</pre>\n</details>\n"
+                )
+            else:
+                diff_html = (
+                    "<details>\n<summary>Agent's notebook changes</summary>\n"
+                    "<p class='footnote'>No SQL changes (both sides identical "
+                    "after SOURCE-format normalization).</p>\n</details>\n"
+                )
+        except Exception as e:
+            diff_html = (
+                f"<details><summary>Agent's notebook changes</summary>"
+                f"<p class='footnote'>Could not fetch notebook diff: {_h(e)}</p></details>"
+            )
+
+    # --- Isolation baseline failure surface ---
+    iso_attempt = summary.get("isolation_baseline") or {}
+    iso_failure_html = ""
+    if iso_attempt and not iso_attempt.get("succeeded"):
+        reason = iso_attempt.get("failure_reason") or ""
+        rs = iso_attempt.get("result_state") or "FAILED"
+        iso_failure_html = (
+            f"<blockquote><strong>❌ Isolation baseline RUN FAILED</strong> "
+            f"(job <code>{_h(iso_attempt.get('iso_job_id'))}</code>, "
+            f"run <code>{_h(iso_attempt.get('iso_run_id'))}</code>, "
+            f"result_state=<code>{_h(rs)}</code>).<br>"
+            f"<strong>Failure reason:</strong> <code>{_h(reason[:400])}</code></blockquote>"
+        )
+
+    # --- Sandbox artifacts (collapsed) ---
+    sbx = clone_meta.get("write_targets_sandbox", [])
+    artifacts_html = (
+        "<details>\n<summary>Sandbox proof artifacts</summary>\n<ul>"
+        f"<li>Sandbox table(s): {', '.join(f'<code>{_h(x)}</code>' for x in sbx)}</li>"
+        f"<li>Sandbox notebook: <code>{_h(clone_meta.get('sandbox_notebook_path'))}</code></li>"
+        f"<li>Sandbox job: <code>{_h(clone_meta.get('sandbox_job_id'))}</code></li>"
+        f"<li>Raw scores + full diff_tables output: <code>evals/proposals/{_h(summary['run_id'])}/proposal.json</code></li>"
+        f"<li>Evaluator agent raw JSON: <code>evals/proposals/{_h(summary['run_id'])}/evaluator.json</code></li>"
+        "</ul></details>\n"
+    )
+
+    # --- Approval checklist ---
+    checklist_html = (
+        "<details>\n<summary>Approval checklist</summary>\n<ol>"
+        "<li>Review the deterministic verdict and the independent evaluator verdict above. If they agree, that's the cleanest case.</li>"
+        "<li>If the evaluator flagged <code>SHIP_WITH_CAVEATS</code>, read each anomaly's <em>downstream risk</em> column and confirm with the owners of any consumer of this table that the cited edge cases don't affect them.</li>"
+        f"<li>If both gates pass and the evaluator is <code>SHIPPABLE</code>, open a PR against <code>Pocket-Fm/de_databricks</code> modifying <code>{_h(clone_meta.get('original_notebook_path'))}</code>.</li>"
+        f"<li>After merge, the next run of prod job <code>{_h(summary['prod_job_id'])}</code> picks up the change via git_source.</li>"
+        f"<li>Monitor task <code>{_h(summary['task_key'])}</code> runtime; expected median ~{opt_ms/1000:.0f}s.</li>"
+        "</ol></details>\n"
+    )
+
+    # --- Assemble ---
+    title = f"optimize {summary['task_key']} in job {summary['prod_job_id']}"
+    head = _HTML_HEAD.format(title=_h(title))
+    body = (
+        f"<h1>Proposal: optimize <code>{_h(summary['task_key'])}</code> "
+        f"in job <code>{_h(summary['prod_job_id'])}</code></h1>\n"
+        f"<div class='verdict-banner {banner_class}'>{_h(banner_text)}<br>"
+        f"<span class='footnote'>Run id: <code>{_h(summary['run_id'])}</code> · "
+        f"Scored against sandbox run <code>{_h(summary.get('scored_run_id') or 'unknown')}</code></span>"
+        f"</div>\n"
+        f"<h2>TL;DR</h2>\n{tldr_table}\n"
+        f"{iso_failure_html}\n"
+        f"<h2>Equivalence by boundary table</h2>\n{per_table_table}\n"
+        f"<p class='footnote'>Verdict types: <code>IDENTICAL</code> (byte-identical within tolerance), "
+        f"<code>FLOAT_REORDER_ONLY</code> (machine-epsilon float drift), "
+        f"<code>REAL_DIFFERENCE</code> (real semantic divergence). "
+        f"Modes: <code>full_rewrite</code> = compared against full pinned prod table; "
+        f"<code>incremental</code> = compared against just this task's commit increment.</p>\n"
+        f"{increment_section_html}\n"
+        f"{_render_evaluator_section_html(summary)}\n"
+        f"{_render_nd_section_html(summary)}\n"
+        f"{drift_profile_html}\n"
+        f"{diff_html}\n"
+        f"{artifacts_html}\n"
+        f"{checklist_html}\n"
+    )
+    return head + body + _HTML_FOOT
 
 
 def _render_nd_section(summary: dict[str, Any]) -> str:
@@ -2149,10 +3327,15 @@ def resume(
         summary["tier1_full_detail"] = _sc["tier1_full_detail"]
 
     (proposal_dir / "proposal.json").write_text(json.dumps(summary, indent=2, default=str))
-    md = _render_finalize_md(summary=summary, clone_meta=clone_meta, proposal_dir=proposal_dir)
-    (proposal_dir / "proposal.md").write_text(md)
+    html = _render_finalize_html(summary=summary, clone_meta=clone_meta, proposal_dir=proposal_dir)
+    (proposal_dir / "proposal.html").write_text(html)
+    # Remove any stale .md from a prior pre-HTML run so it isn't confusing.
+    legacy_md = proposal_dir / "proposal.md"
+    if legacy_md.exists():
+        try: legacy_md.unlink()
+        except Exception: pass
     console.print(
-        f"\n[bold green]done.[/] proposal at {proposal_dir / 'proposal.md'}"
+        f"\n[bold green]done.[/] proposal at {proposal_dir / 'proposal.html'}"
     )
     return summary
 
@@ -2171,6 +3354,7 @@ def _score_resume(
     write_target_modes: dict[str, str] | None = None,
     prod_pre_versions: dict[str, int] | None = None,
     partition_columns_by_target: dict[str, list[str]] | None = None,
+    isolation_ms: int | None = None,
 ) -> dict[str, Any]:
     """Score a resume run via the shared equivalence+nondeterminism helper —
     identical Tier-1 semantics to propose / propose-finalize."""
@@ -2187,18 +3371,14 @@ def _score_resume(
         optimized_succeeded=optimized_succeeded,
     )
     tier1 = _tier1_from_equivalence(eq)
-    runtime_pct = 0.0
-    base_ms = int(baseline_seconds * 1000)
-    if optimized_succeeded and optimized_ms > 0 and base_ms > 0:
-        runtime_pct = (base_ms - optimized_ms) / base_ms * 100
     return {
         "tier1": tier1,
-        "tier3": {
-            "passed": runtime_pct >= 15.0,
-            "runtime_improvement_pct": round(runtime_pct, 2),
-            "baseline_duration_ms": base_ms,
-            "optimized_duration_ms": optimized_ms,
-        },
+        "tier3": _compute_tier3(
+            optimized_succeeded=optimized_succeeded,
+            optimized_ms=optimized_ms,
+            prod_median_ms=int(baseline_seconds * 1000),
+            isolation_ms=isolation_ms,
+        ),
         "nondeterminism": eq["nondeterminism"],
         "tier1_full_detail": eq["per_table"],
     }
@@ -2208,6 +3388,7 @@ def finalize(
     run_id: str,
     *,
     console: Console | None = None,
+    isolation_baseline: bool = False,
 ) -> dict[str, Any]:
     """Generate proposal.md for an in-progress / interrupted / agent-stuck
     propose run. Reads `clone.json` to find the boundary tables + sandbox job,
@@ -2216,6 +3397,11 @@ def finalize(
 
     Useful when the agent ran out of LLM budget mid-iteration, or you want to
     grab the current best state without waiting for it to converge.
+
+    `isolation_baseline=True`: also run the ORIGINAL notebook in the sandbox
+    on identical pinned inputs (one extra sandbox job, cached in
+    `isolation.json`). Yields an apples-to-apples Tier-3 algebra impact
+    number, separated from prod's co-tenant contention.
     """
     from ..tools.databricks import diff_tables, list_job_runs, get_job_run, get_notebook_source
     console = console or Console()
@@ -2227,6 +3413,10 @@ def finalize(
             f"or pre-dates the clone-persistence change. Cannot finalize."
         )
     clone_meta = json.loads((proposal_dir / "clone.json").read_text())
+    # Add run_id into clone_meta so helpers downstream can stamp jobs/tags
+    # consistently even when the source file was written before this field
+    # existed.
+    clone_meta.setdefault("run_id", run_id)
     sandbox_job_id = int(clone_meta["sandbox_job_id"])
     prod_job_id = int(clone_meta["prod_job_id"])
     task_key = clone_meta["task_key"]
@@ -2303,11 +3493,40 @@ def finalize(
     per_table = eq["per_table"]
     all_eq = eq["all_eq"]
 
-    # 4. Tier 3 perf
-    runtime_pct = 0.0
+    # 3b. Isolation baseline (apples-to-apples Tier-3 control) — opt-in.
+    # Runs the ORIGINAL notebook in the sandbox on identical pinned inputs;
+    # cached on disk so re-finalize reuses it. Without this, Tier-3's
+    # "vs prod_median" number conflates algebra improvement with the
+    # relief from running uncontended.
+    iso_result: dict[str, Any] | None = None
+    if isolation_baseline:
+        console.print(
+            "[cyan]→ measuring isolation baseline (original notebook in sandbox)[/]"
+        )
+        iso_result = _measure_isolation_baseline(
+            proposal_dir=proposal_dir, clone_meta=clone_meta, console=console,
+        )
+    else:
+        # Use a cached iso baseline if it's already there from a prior call.
+        iso_path = proposal_dir / "isolation.json"
+        if iso_path.exists():
+            try:
+                cached = json.loads(iso_path.read_text())
+                if cached.get("succeeded"):
+                    iso_result = cached
+                    console.print(
+                        f"  [dim]using cached isolation baseline "
+                        f"(duration {cached['duration_ms']/1000:.0f}s) — "
+                        "pass --isolation-baseline to refresh[/]"
+                    )
+            except Exception:
+                pass
+
+    # 4. Tier 3 perf via the apples-to-apples-aware helper.
     base_ms = baseline.get("median_duration_ms") or 0
-    if scored_exec_ms > 0 and base_ms > 0:
-        runtime_pct = (base_ms - scored_exec_ms) / base_ms * 100
+    iso_ms = (iso_result.get("duration_ms")
+              if (iso_result and iso_result.get("succeeded")) else None)
+    summary["isolation_baseline"] = iso_result
     summary["scores"] = {
         "tier1": {
             "passed": all_eq,
@@ -2316,30 +3535,142 @@ def finalize(
                               "drift_concentration": v.get("drift_concentration", {})}
                           for k, v in per_table.items()},
         },
-        "tier3": {
-            "passed": runtime_pct >= 15.0,
-            "runtime_improvement_pct": round(runtime_pct, 2),
-            "baseline_duration_ms": base_ms,
-            "optimized_duration_ms": scored_exec_ms,
-        },
+        "tier3": _compute_tier3(
+            optimized_succeeded=True,
+            optimized_ms=scored_exec_ms,
+            prod_median_ms=base_ms,
+            isolation_ms=iso_ms,
+        ),
     }
     summary["tier1_full_detail"] = per_table  # full diff for the report
+
+    # 4b. Independent anomaly evaluator agent (advisory, read-only).
+    # Runs AFTER the deterministic diff, ONCE PER WRITE TARGET. Produces
+    # per-table verdicts plus a worst-of aggregate. Appears alongside the
+    # deterministic verdict in proposal.html — does NOT gate Tier-1/Tier-3.
+    # Graceful skip on any failure.
+    summary["evaluator"] = None
+    try:
+        from .anomaly_evaluator import run_anomaly_evaluator
+        if write_orig and write_sb:
+            orig_sql_path = proposal_dir / "notebook_original.txt"
+            original_sql = orig_sql_path.read_text() if orig_sql_path.exists() else ""
+            try:
+                optimized_sql = get_notebook_source(
+                    clone_meta["sandbox_notebook_path"]
+                )["content"]
+            except Exception:
+                pre_path = proposal_dir / "notebook_sandbox_pre_agent.txt"
+                optimized_sql = pre_path.read_text() if pre_path.exists() else ""
+
+            per_target_results: dict[str, dict[str, Any]] = {}
+            total = len(write_orig)
+            for idx, (orig, sb) in enumerate(zip(write_orig, write_sb), start=1):
+                diff_for_eval = per_table.get(orig)
+                if not diff_for_eval:
+                    continue
+                prod_ver = (clone_meta.get("prod_boundary_versions") or {}).get(orig)
+                prod_ref = (
+                    f"{orig} VERSION AS OF {prod_ver}"
+                    if prod_ver is not None else orig
+                )
+                mode = (clone_meta.get("write_target_modes") or {}).get(
+                    orig, "full_rewrite"
+                )
+                console.print(
+                    f"[cyan]→ evaluator: target {idx}/{total} "
+                    f"({orig})[/]"
+                )
+                # Per-target evaluator.json filename keeps individual runs
+                # auditable; the combined view lives in summary["evaluator"].
+                safe = re.sub(r"[^A-Za-z0-9_]+", "__", orig)
+                per_path = proposal_dir / (
+                    "evaluator.json" if total == 1
+                    else f"evaluator__{safe}.json"
+                )
+                ev_result = run_anomaly_evaluator(
+                    prod_fqn=prod_ref,
+                    sandbox_fqn=sb,
+                    original_sql=original_sql,
+                    optimized_sql=optimized_sql,
+                    diff_result=diff_for_eval,
+                    proposal_dir=proposal_dir,
+                    console=console,
+                    write_target_mode=mode,
+                    persist_path=per_path,
+                )
+                if ev_result is not None:
+                    per_target_results[orig] = ev_result
+
+            if per_target_results:
+                verdicts = [
+                    r.get("verdict") for r in per_target_results.values()
+                ]
+                agg = _worst_evaluator_verdict(verdicts)
+                summary["evaluator"] = {
+                    "per_table": per_target_results,
+                    "aggregate_verdict": agg,
+                    "n_targets_evaluated": len(per_target_results),
+                    "n_targets_total": total,
+                }
+                # Also persist the combined view so it's a single file to
+                # inspect for multi-target tasks.
+                if total > 1:
+                    try:
+                        (proposal_dir / "evaluator.json").write_text(
+                            json.dumps(summary["evaluator"], indent=2, default=str)
+                        )
+                    except Exception:
+                        pass
+                console.print(
+                    f"  [{ {'SHIPPABLE':'green','SHIP_WITH_CAVEATS':'yellow','DO_NOT_SHIP':'red'}.get(agg, 'yellow') }]"
+                    f"evaluator aggregate verdict: {agg}[/]  "
+                    f"(across {len(per_target_results)}/{total} target(s))"
+                )
+    except Exception as e:
+        console.print(
+            f"[yellow]evaluator agent invocation failed: "
+            f"{type(e).__name__}: {e}; proceeding without it[/]"
+        )
 
     # 5. Write proposal.json
     (proposal_dir / "proposal.json").write_text(json.dumps(summary, indent=2, default=str))
 
-    # 6. Render proposal.md
-    md = _render_finalize_md(summary=summary, clone_meta=clone_meta, proposal_dir=proposal_dir)
-    (proposal_dir / "proposal.md").write_text(md)
+    # 6. Render proposal.html (collapsible, browser-friendly)
+    html = _render_finalize_html(summary=summary, clone_meta=clone_meta, proposal_dir=proposal_dir)
+    (proposal_dir / "proposal.html").write_text(html)
+    # Remove any stale .md from a prior pre-HTML run.
+    legacy_md = proposal_dir / "proposal.md"
+    if legacy_md.exists():
+        try: legacy_md.unlink()
+        except Exception: pass
 
     # 7. Print verdict
     t1, t3 = summary["scores"]["tier1"], summary["scores"]["tier3"]
     verdict = "[bold green]PASS[/]" if (t1["passed"] and t3["passed"]) else "[bold yellow]NEEDS REVIEW[/]"
     console.print(f"\n  Overall: {verdict}")
     console.print(f"  Tier 1 (equivalence): {'PASS' if t1['passed'] else 'FAIL'}")
-    console.print(f"  Tier 3 (perf):        {'PASS' if t3['passed'] else 'FAIL'}  "
-                  f"({t3['runtime_improvement_pct']:+.1f}% vs {base_ms/1000:.0f}s baseline)")
-    console.print(f"  proposal: {proposal_dir / 'proposal.md'}")
+    # Tier 3 line — show the gate that was actually applied, plus the
+    # apples-to-apples decomposition if isolation baseline is available.
+    gate = t3.get("primary_gate", "prod_shipping_impact_pct")
+    if t3.get("algebra_impact_pct") is not None:
+        console.print(
+            f"  Tier 3 (perf):        {'PASS' if t3['passed'] else 'FAIL'} "
+            f"(algebra_impact={t3['algebra_impact_pct']:+.1f}% vs "
+            f"{(iso_ms or 0)/1000:.0f}s isolation; "
+            f"prod_shipping={t3['prod_shipping_impact_pct']:+.1f}% vs "
+            f"{base_ms/1000:.0f}s prod_median; "
+            f"contention_overhead="
+            f"{(t3.get('contention_overhead_pct') or 0):+.1f}%)"
+        )
+    else:
+        console.print(
+            f"  Tier 3 (perf):        {'PASS' if t3['passed'] else 'FAIL'} "
+            f"({t3['prod_shipping_impact_pct']:+.1f}% vs {base_ms/1000:.0f}s prod_median; "
+            "isolation baseline UNMEASURED — re-run with --isolation-baseline "
+            "for apples-to-apples)"
+        )
+    console.print(f"  proposal: {proposal_dir / 'proposal.html'}")
     return summary
 
 
@@ -2414,6 +3745,89 @@ def _render_finalize_md(
 
     nd_section = _render_nd_section(summary)
 
+    # Tier 3 decomposition — distinct rows when an isolation baseline exists.
+    iso_ms = t3.get("isolation_baseline_ms")
+    if iso_ms:
+        tier3_rows = (
+            f"| Prod median runtime (with co-tenant contention) | "
+            f"{summary['baseline'].get('median_duration_ms', 0)/1000:.0f}s "
+            f"({summary['baseline'].get('median_duration_ms', 0)/60000:.1f} min) |\n"
+            f"| Isolation baseline (ORIGINAL notebook in sandbox) | "
+            f"{iso_ms/1000:.0f}s ({iso_ms/60000:.1f} min) |\n"
+            f"| Optimized runtime (in sandbox) | "
+            f"{(t3.get('optimized_duration_ms') or 0)/1000:.0f}s "
+            f"({(t3.get('optimized_duration_ms') or 0)/60000:.1f} min) |\n"
+            f"| **Algebra impact** (apples-to-apples — primary gate) | "
+            f"**{(t3.get('algebra_impact_pct') or 0):+.1f}%** "
+            f"{'✅' if t3.get('passed') else '❌'} |\n"
+            f"| Prod shipping impact (includes contention relief) | "
+            f"{(t3.get('prod_shipping_impact_pct') or 0):+.1f}% |\n"
+            f"| Contention overhead in prod (informational) | "
+            f"{(t3.get('contention_overhead_pct') or 0):+.1f}% |\n"
+        )
+    else:
+        tier3_rows = (
+            f"| Prod median runtime | "
+            f"{summary['baseline'].get('median_duration_ms', 0)/1000:.0f}s "
+            f"({summary['baseline'].get('median_duration_ms', 0)/60000:.1f} min) |\n"
+            f"| Optimized runtime | "
+            f"{(t3.get('optimized_duration_ms') or 0)/1000:.0f}s "
+            f"({(t3.get('optimized_duration_ms') or 0)/60000:.1f} min) |\n"
+            f"| **Runtime improvement vs prod median** "
+            f"⚠️ *(includes contention relief — algebra impact UNMEASURED)* | "
+            f"**{(t3.get('prod_shipping_impact_pct') or 0):+.1f}%** "
+            f"{'✅' if t3.get('passed') else '❌'} |\n"
+        )
+    # If iso was attempted but failed, surface the actual reason inline so
+    # the human reviewer doesn't have to chase Databricks logs.
+    iso_attempt = summary.get("isolation_baseline") or {}
+    iso_failure_block = ""
+    if iso_attempt and not iso_attempt.get("succeeded"):
+        reason = iso_attempt.get("failure_reason") or ""
+        rs = iso_attempt.get("result_state") or "FAILED"
+        ij = iso_attempt.get("iso_job_id")
+        ir = iso_attempt.get("iso_run_id")
+        iso_failure_block = (
+            f"\n> ❌ **Isolation baseline RUN FAILED** "
+            f"(job `{ij}`, run `{ir}`, result_state=`{rs}`). "
+            "Without it, Tier-3 above falls back to `prod_shipping_impact` "
+            "(includes contention relief; not apples-to-apples).\n"
+        )
+        if reason:
+            iso_failure_block += (
+                f"> \n> **Failure reason**: `{reason[:400]}`\n"
+            )
+        pre_errs = iso_attempt.get("pre_create_errors") or []
+        if pre_errs:
+            iso_failure_block += "> \n> **Pre-create errors**:\n"
+            for e in pre_errs:
+                iso_failure_block += (
+                    f"> - `{e.get('iso_fqn')}`: {e.get('error')}\n"
+                )
+        iso_failure_block += (
+            "> \n> Common cause: the original notebook uses `INSERT INTO` / "
+            "`MERGE INTO` and assumes the target table already exists "
+            "(prod created it once, ages ago). The iso runner now pre-"
+            "creates the iso table via `CREATE TABLE … LIKE <prod_fqn>` — "
+            "but if THAT failed too, the schema mirror itself is the "
+            "issue. Inspect the pre-create error above; re-run with "
+            f"`helios propose-finalize {summary['run_id']} "
+            "--isolation-baseline` once resolved.\n"
+        )
+
+    iso_note = (
+        ""
+        if iso_ms else
+        iso_failure_block or (
+            "\n> ⚠️ **Isolation baseline not measured.** Tier-3 here compares "
+            "sandbox (uncontended) against prod median (contended by ~N "
+            "co-tenant tasks), so part of the win may be contention relief, "
+            "not algebra. Re-run with `helios propose-finalize "
+            f"{summary['run_id']} --isolation-baseline` for an apples-to-apples "
+            "Tier-3 number.\n"
+        )
+    )
+
     return f"""# Proposal: optimize `{summary['task_key']}` in job {summary['prod_job_id']}
 
 **Status**: {verdict}
@@ -2424,11 +3838,9 @@ def _render_finalize_md(
 
 | Metric | Value |
 |---|---|
-| Baseline median runtime | {summary['baseline'].get('median_duration_ms', 0)/1000:.0f}s ({summary['baseline'].get('median_duration_ms', 0)/60000:.1f} min) |
-| Optimized runtime | {(t3.get('optimized_duration_ms') or 0)/1000:.0f}s ({(t3.get('optimized_duration_ms') or 0)/60000:.1f} min) |
-| **Runtime improvement** | **{t3.get('runtime_improvement_pct', 0):+.1f}%** {'✅' if t3.get('passed') else '❌'} |
-| Tier 1 (row-level equivalence) | **{'PASS' if t1['passed'] else 'FAIL'}** |
-| Tier 3 (runtime ≥15%) | **{'PASS' if t3['passed'] else 'FAIL'}** |
+{tier3_rows}| Tier 1 (row-level equivalence) | **{'PASS' if t1['passed'] else 'FAIL'}** |
+| Tier 3 (perf ≥{t3.get('pass_threshold_pct', 15.0):.0f}%) — primary gate: `{t3.get('primary_gate', 'prod_shipping_impact_pct')}` | **{'PASS' if t3['passed'] else 'FAIL'}** |
+{iso_note}
 
 ## Equivalence by boundary table
 

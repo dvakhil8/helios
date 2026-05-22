@@ -709,6 +709,20 @@ _EXCHANGE_PATTERN = re.compile(
 _SCAN_PATTERN = re.compile(
     r"\b(?:Photon)?(?:FileScan|Scan|LocalTableScan)\b[^\n]*"
 )
+# Extract the underlying relation FQN from a Scan line so we can count how
+# many times each relation is read. Multiple scans of the same base table
+# typically indicate a CTE/intermediate that's referenced 2+ times and
+# recomputed each time — a textbook `CACHE TABLE` candidate.
+# Matches lines like:
+#   PhotonScan parquet spice_catalog.prod.foo (5)
+#   FileScan parquet gold_catalog.growth.bar[cols]
+#   BatchScan delta gold_catalog.fm.baz
+# Skips OneRowRelation / ExistingRDD / temp views (no 3-part FQN).
+_SCAN_RELATION_PATTERN = re.compile(
+    r"(?:Photon)?(?:Batch|File)?Scan\s+"
+    r"(?:parquet|delta|orc|csv|json|jsonl|avro|text|libsvm|tfrecord)?\s*"
+    r"([a-zA-Z_][\w]*\.[a-zA-Z_][\w]*\.[a-zA-Z_][\w]*)"
+)
 # Simple independent extractors — robust to nested parens.
 _ROWCOUNT_PATTERN = re.compile(r"rowCount=([0-9.eE+-]+|[0-9.]+[KMBT]?)")
 _SIZEBYTES_PATTERN = re.compile(r"sizeInBytes=([0-9.eE+-]+\s*(?:B|KiB|MiB|GiB|TiB)?)")
@@ -806,12 +820,78 @@ def _explain_one_mode(
             "Each Exchange is a stage boundary that materializes data on disk."
         )
 
+    # Repeat-scan detection: each relation scanned 2+ times in the plan is a
+    # `CACHE TABLE` candidate. Recomputing the same intermediate N times is
+    # exactly what caching collapses to a single read. Skip OneRowRelation /
+    # ExistingRDD / temp views — only 3-part-FQN base tables.
+    scan_relations = _SCAN_RELATION_PATTERN.findall(plan_text)
+    repeat_scans = {
+        rel: cnt for rel, cnt in Counter(scan_relations).items() if cnt >= 2
+    }
+    if repeat_scans:
+        for rel, cnt in sorted(repeat_scans.items(), key=lambda x: -x[1])[:5]:
+            warnings.append(
+                f"`{rel}` scanned {cnt}× in the plan — strong "
+                "`CACHE TABLE` candidate. Materialize the intermediate "
+                "once with `CACHE LAZY TABLE <name> AS <select>` and "
+                "reference the cached name in downstream CTEs. Skip if "
+                "the relation is larger than executor memory (would "
+                "spill and negate the win)."
+            )
+
+    # Explosive-intermediate detection. Parse rowCount=N strings into floats
+    # (handles scientific notation like 4.2e10 and K/M/B/T suffixes), find
+    # the max, and flag when any operator's estimated cardinality crosses 1B
+    # rows. This is a STRUCTURAL bottleneck: bounded-tier optimizations
+    # (BROADCAST/CACHE/RANGE_JOIN) cannot shrink the intermediate they
+    # operate over — only an algebra-changing rewrite (Category 6) can.
+    def _parse_count(s: str) -> float:
+        s = (s or "").strip().upper()
+        if not s:
+            return 0.0
+        mult = 1.0
+        if s.endswith("T"): mult, s = 1e12, s[:-1]
+        elif s.endswith("B"): mult, s = 1e9, s[:-1]
+        elif s.endswith("M"): mult, s = 1e6, s[:-1]
+        elif s.endswith("K"): mult, s = 1e3, s[:-1]
+        try:
+            return float(s) * mult
+        except ValueError:
+            return 0.0
+
+    parsed_counts = [_parse_count(r) for r in row_counts_seen]
+    max_rowcount = max(parsed_counts) if parsed_counts else 0.0
+    if max_rowcount >= 1e9:
+        # Strengthen the message when CartesianProduct or BNLJ is present —
+        # those are the classic structural-explosion shapes.
+        if join_counts.get("CartesianProduct"):
+            shape_hint = " (combined with CartesianProduct — classic cross-join cardinality explosion)"
+        elif join_counts.get("BroadcastNestedLoopJoin"):
+            shape_hint = " (combined with BroadcastNestedLoopJoin — non-equi join over large inputs)"
+        else:
+            shape_hint = ""
+        warnings.append(
+            f"Estimated {max_rowcount:.2e}-row intermediate detected"
+            f"{shape_hint}. This is a STRUCTURAL bottleneck — lower-tier "
+            "optimizations (BROADCAST/CACHE/RANGE_JOIN) CANNOT shrink it. "
+            "Go directly to Category-6 algebraic rewrite: pre-aggregate to "
+            "a smaller cardinality BEFORE cross-joins; replace LEFT JOIN "
+            "with INNER when the RHS is sparse (e.g. <10% of LHS has "
+            "matching rows); replace non-equi joins with window functions "
+            "where possible; materialize ONE intermediate at a smaller "
+            "cardinality and downstream-consume it. Bounded-tier wins on "
+            "this query are capped at a fraction of what algebra rewrite "
+            "can deliver."
+        )
+
     summary: dict[str, Any] = {
         "join_strategies": dict(join_counts),
         "num_shuffles": len(exchanges),
         "scan_count": len(scans),
         "scans": scans[:10],  # first 10 (truncate to keep size bounded)
+        "repeat_scans": repeat_scans,  # {fqn: count} for relations scanned 2+ times
         "estimated_row_counts": row_counts_seen[:15],
+        "max_estimated_rowcount": max_rowcount,  # for structural-bottleneck detection
         "estimated_sizes": sizes_seen[:15],
         "warnings": warnings,
     }
@@ -1520,10 +1600,130 @@ def get_job_permission_levels(job_id: int) -> dict[str, Any]:
 # Registry
 # =============================================================================
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Read-only SQL execution — used by the anomaly evaluator agent.
+#
+# The evaluator inspects prod vs sandbox tables to find equivalence anomalies.
+# It must NEVER mutate data — so this guard rejects ANY DDL/DML statement
+# regardless of catalog. Tighter than the propose-mode write guard (which
+# only rejects writes outside `helios_eval_runs.*`).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Verbs that mutate state in some way. Comprehensive; better to over-reject.
+_FORBIDDEN_VERBS: frozenset[str] = frozenset({
+    "INSERT", "UPDATE", "DELETE", "MERGE",
+    "CREATE", "DROP", "ALTER", "REPLACE", "RENAME",
+    "TRUNCATE", "COMMENT",
+    "GRANT", "REVOKE",
+    "OPTIMIZE", "VACUUM", "RESTORE",
+    "CACHE", "UNCACHE", "REFRESH", "ANALYZE", "MSCK",
+    "COPY", "LOAD", "PUT", "GET",
+    "USE", "SET",  # SET can change session config; conservative reject
+})
+
+
+def _assert_read_only(sql: str) -> None:
+    """Reject any statement that could mutate state. Conservative: when in
+    doubt, reject. Handles:
+      - leading whitespace + line/block comments
+      - multi-statement SQL (split on `;`)
+      - CTE-prefixed writes (`WITH ... INSERT/UPDATE/DELETE/MERGE`)
+      - `EXPLAIN <write>` (EXPLAIN itself doesn't mutate, but its argument
+        could parse a write; reject to be safe)
+    Raises ValueError on any forbidden verb. Used by execute_sql_readonly.
+    """
+    if not sql or not sql.strip():
+        raise ValueError("empty SQL")
+
+    # Strip block comments and line comments first.
+    s = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    s = re.sub(r"--[^\n]*", " ", s)
+
+    # Split on `;` to catch multi-statement payloads. Validate each non-empty
+    # piece. (Single-statement SQL still passes through cleanly.)
+    for stmt in s.split(";"):
+        stmt = stmt.strip()
+        if not stmt:
+            continue
+        # First identifier-like token
+        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", stmt)
+        if not m:
+            continue
+        first = m.group(1).upper()
+
+        # WITH-prefixed CTEs: scan the whole statement for any forbidden verb
+        # appearing in non-string context. CTE bodies are themselves SELECTs,
+        # but `WITH … INSERT INTO …` is allowed by Spark and mutates.
+        if first == "WITH":
+            # Strip string literals to avoid false positives inside data.
+            stripped = re.sub(r"'(?:''|[^'])*'", " ", stmt)
+            stripped = re.sub(r'"(?:""|[^"])*"', " ", stripped)
+            for verb in _FORBIDDEN_VERBS:
+                if re.search(rf"\b{verb}\b", stripped, re.IGNORECASE):
+                    raise ValueError(
+                        f"read-only guard: WITH-prefixed statement contains "
+                        f"forbidden verb `{verb}` (mutating SQL is not allowed "
+                        f"in evaluator mode)"
+                    )
+            continue
+
+        # EXPLAIN of a write statement: look past EXPLAIN [FORMATTED|COST|...]
+        if first == "EXPLAIN":
+            after = re.sub(
+                r"^\s*EXPLAIN\s+(?:FORMATTED|COST|EXTENDED|CODEGEN)?\s*",
+                "", stmt, flags=re.IGNORECASE,
+            )
+            m2 = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)", after)
+            if m2 and m2.group(1).upper() in _FORBIDDEN_VERBS:
+                raise ValueError(
+                    f"read-only guard: EXPLAIN of `{m2.group(1).upper()}` is "
+                    "not permitted (would expose a write-plan)"
+                )
+            continue
+
+        # Plain leading-verb check.
+        if first in _FORBIDDEN_VERBS:
+            raise ValueError(
+                f"read-only guard: SQL starts with `{first}` — mutating "
+                "statements are not allowed in evaluator mode. Only SELECT, "
+                "DESCRIBE, SHOW, and EXPLAIN-of-SELECT are permitted."
+            )
+
+
+EXECUTE_SQL_READONLY_SCHEMA: dict[str, Any] = {
+    "name": "execute_sql_readonly",
+    "description": (
+        "Execute a SELECT/DESCRIBE/SHOW query against a Databricks SQL "
+        "Warehouse and return the rows. READ-ONLY: any DDL/DML "
+        "(INSERT/UPDATE/DELETE/MERGE/CREATE/DROP/ALTER/TRUNCATE/OPTIMIZE/"
+        "VACUUM/ANALYZE/CACHE/GRANT/...) is rejected before reaching "
+        "Databricks. Use this for inspection, counts, samples, schema "
+        "discovery, and any investigation query that should not mutate "
+        "state. Same return shape as execute_sql."
+    ),
+    "input_schema": EXECUTE_SQL_SCHEMA["input_schema"],
+}
+
+
+def execute_sql_readonly(
+    sql: str,
+    warehouse_id: str | None = None,
+    row_limit: int = 1000,
+    timeout_seconds: int = 300,
+) -> dict[str, Any]:
+    """Read-only wrapper around execute_sql. Rejects any DDL/DML verb."""
+    _assert_read_only(sql)
+    return execute_sql(
+        sql, warehouse_id=warehouse_id, row_limit=row_limit,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 Tool = tuple[dict[str, Any], Callable[..., Any]]
 
 REGISTRY: dict[str, Tool] = {
     "execute_sql": (EXECUTE_SQL_SCHEMA, execute_sql),
+    "execute_sql_readonly": (EXECUTE_SQL_READONLY_SCHEMA, execute_sql_readonly),
     "check_table_health": (CHECK_TABLE_HEALTH_SCHEMA, check_table_health),
     "list_jobs": (LIST_JOBS_SCHEMA, list_jobs),
     "get_job": (GET_JOB_SCHEMA, get_job),

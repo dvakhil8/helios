@@ -337,6 +337,15 @@ def propose_resume_cmd(
 @app.command("propose-finalize")
 def propose_finalize_cmd(
     run_id: str = typer.Argument(..., help="The propose run_id whose proposal.md you want to generate (or regenerate)."),
+    isolation_baseline: bool = typer.Option(
+        False, "--isolation-baseline",
+        help=(
+            "Also run the ORIGINAL notebook in the sandbox on identical "
+            "pinned inputs to capture an apples-to-apples Tier-3 baseline "
+            "(removes prod's co-tenant contention as a confound). One extra "
+            "sandbox job; cached in isolation.json for re-finalize."
+        ),
+    ),
 ) -> None:
     """Generate proposal.md for an in-progress / interrupted propose run.
 
@@ -348,7 +357,7 @@ def propose_finalize_cmd(
     _ensure_env()
     from .evals.propose import finalize
 
-    finalize(run_id=run_id, console=console)
+    finalize(run_id=run_id, console=console, isolation_baseline=isolation_baseline)
 
 
 @app.command("propose")
